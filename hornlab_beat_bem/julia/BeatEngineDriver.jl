@@ -853,6 +853,11 @@ function release_assembly_payload!(payload)
         get(payload.system, :on_gpu, false) && release_metal_burton_miller_system!(payload.system)
         return nothing
     end
+    if get(payload, :kind, :operators) === :fused_cuda
+        # solve_burton_miller_system_cuda! already freed the matrix and rhs;
+        # the drive vector is freed by the solve loop. Nothing is resident.
+        return nothing
+    end
     release_operator_storage!(payload.operators)
     return nothing
 end
@@ -1218,6 +1223,15 @@ function solve_request_impl(request)
         (beat_backend != :metal || (metal_assembly_mode != :host_staged &&
             BeatEngineCore._normalized_metal_singular_mode() == :native &&
             BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather))
+    # Opt-in route through the single-matrix CUDA Burton-Miller assembler
+    # (~2A-NA-N storage instead of four operators). Off by default so the
+    # default CUDA path is byte-for-byte today's. The ground-plane image
+    # path has no coverage here yet and near-correction lives on the
+    # four-operator path, so both keep the old assembly.
+    fused_burton_miller_cuda = beat_backend == :cuda &&
+        near_selection === nothing &&
+        get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1" &&
+        Symbol(symmetry_mode) != :ground
     near_correction_cache = nothing
     image_near_correction_caches = nothing
     device_near_correction_cache = nothing
@@ -1470,6 +1484,23 @@ function solve_request_impl(request)
                     next_k = FloatType(2pi) * FloatType(frequencies[index + 1]) / sound_speed
                     pending_assembly = Threads.@spawn assemble_for_frequency(next_k)
                 end
+            elseif fused_burton_miller_cuda
+                fused_q_columns = channel_neumann_columns(
+                    mesh, element_mesh_ids, radiators, channel_names, rho, omega, FloatType;
+                    source_motion=source_motion,
+                )
+                size(fused_q_columns, 2) == 1 ||
+                    error("HORNLAB_BEAT_FUSED_BM_CUDA supports exactly one channel")
+                d_q = BeatEngineCore.CUDA_MODULE.CuArray(fused_q_columns[:, 1])
+                cuda_system = BeatEngineCore.assemble_burton_miller_neumann_system_cuda(
+                    mesh, p1_space, dp0_space, d_q, k, selected_rule;
+                    device_cache=device_cache,
+                    singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    symmetry_mode=Symbol(symmetry_mode),
+                )
+                assembly_payload = (kind=:fused_cuda, system=cuda_system, q_columns=fused_q_columns, d_q=d_q)
             elseif fused_burton_miller
                 fused_q_columns = channel_neumann_columns(
                     mesh, element_mesh_ids, radiators, channel_names, rho, omega, FloatType;
@@ -1533,7 +1564,17 @@ function solve_request_impl(request)
         cpu_solve_system = nothing
         fused_pressure = nothing
         dense_solve_report = nothing
-        if assembly_payload.kind === :fused
+        if assembly_payload.kind === :fused_cuda
+            try
+                t_solve += @elapsed begin
+                    fused_pressure = reshape(
+                        BeatEngineCore.solve_burton_miller_system_cuda!(assembly_payload.system), :, 1,
+                    )
+                end
+            finally
+                BeatEngineCore.CUDA_MODULE.unsafe_free!(assembly_payload.d_q)
+            end
+        elseif assembly_payload.kind === :fused
             # Dense LU or diagonally preconditioned GMRES, chosen per solve by
             # a cost model over (dofs, drives). The LU route keeps the property
             # the four-operator path has: one factorization per frequency,
@@ -1578,7 +1619,7 @@ function solve_request_impl(request)
         for (channel_index, channel_name) in enumerate(channel_names)
             pressure = nothing
             q_neumann = nothing
-            if assembly_payload.kind === :fused
+            if assembly_payload.kind in (:fused, :fused_cuda)
                 pressure = Complex{FloatType}.(fused_pressure[:, channel_index])
                 q_neumann = assembly_payload.q_columns[:, channel_index]
             else
@@ -1657,6 +1698,65 @@ function solve_request_impl(request)
         end
 
         release_assembly_payload!(assembly_payload)
+        diagnostics = Dict(
+            "convergence_info" => dense_solve_report === nothing ? 0 :
+                (dense_solve_report.fell_back ? 1 : 0),
+            "message" => dense_solve_report === nothing ? "Julia direct dense solve" :
+                describe_dense_solve(dense_solve_report),
+            "dense_solve_method" => dense_solve_report === nothing ? "lu" :
+                String(dense_solve_report.method),
+            "dense_solve_selection" => dense_solve_report === nothing ? "fixed" :
+                String(dense_solve_report.plan.reason),
+            "dense_solve_fell_back" => dense_solve_report === nothing ? false :
+                dense_solve_report.fell_back,
+            "dense_solve_iterations" => dense_solve_report === nothing ? Int[] :
+                dense_solve_report.iterations,
+            "dense_solve_recent_fallback_hz" => dense_solve_report === nothing ? nothing :
+                get(dense_solve_report.plan, :fallback_frequency_hz, nothing),
+            "dense_solve_iteration_budget" => dense_solve_report === nothing ? nothing :
+                dense_solve_report.iteration_budget,
+            "dense_solve_warm_start_used" => dense_solve_report === nothing ? Bool[] :
+                dense_solve_report.warm_start_used,
+            "dense_solve_fallback_reason" => dense_solve_report === nothing ? nothing :
+                dense_solve_report.fallback_reason,
+            "dense_solve_termination_reasons" => dense_solve_report === nothing ? Symbol[] :
+                dense_solve_report.termination_reasons,
+            "dense_solve_tolerance" => dense_solve_report === nothing ? nothing :
+                dense_solve_report.tolerance,
+            "dense_solve_relative_residuals" => dense_solve_report === nothing ? Float32[] :
+                Float32.(dense_solve_report.relative_residuals),
+            "dense_solve_model_lu_s" => dense_solve_report === nothing ? nothing :
+                Float32(dense_solve_report.plan.lu_model_seconds),
+            "dense_solve_model_gmres_s" => dense_solve_report === nothing ? nothing :
+                Float32(dense_solve_report.plan.gmres_model_seconds),
+            "backend" => String(beat_backend),
+            "symmetry" => symmetry_mode,
+            "regular_assembly_mode" => string(assembly_payload.kind in (:fused, :fused_cuda) ?
+                assembly_payload.system.assembly_mode :
+                get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
+            "blas_threads" => cpu_blas_threads,
+            # The sweep's scheduling is now a per-solve decision, so
+            # say which way it went: a size-aware default that reports
+            # nothing is one whose regressions are invisible.
+            "metal_pipeline" => metal_pipeline,
+            "p1_dof_count" => p1_space.global_dof_count,
+            "regular_quadrature_mode" => regular_quadrature_mode,
+            "regular_quadrature_order" => quadrature_selection.order,
+            "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
+            "cpu_singular_kernel" => assembly_payload.kind === :fused && beat_backend == :cpu ?
+                String(assembly_payload.system.singular_kernel) : nothing,
+            "cpu_field_kernel" => beat_backend == :cpu ? String(BeatEngineCore.beat_cpu_field_kernel()) : nothing,
+            "regular_quadrature_base_order" => base_regular_order,
+            "regular_quadrature_wavelength_mesh_stat" => quadrature_selection.mesh_stat,
+            "regular_quadrature_wavelength_mesh_area_stat_m2" => quadrature_selection.mesh_area_stat,
+            "regular_quadrature_wavelength_element_length_m" => quadrature_selection.element_length_m,
+            "regular_quadrature_wavelength_kh" => quadrature_selection.kh,
+            "regular_quadrature_wavelength_kh_q1_max" => quadrature_selection.q1_cutoff,
+            "regular_quadrature_wavelength_kh_q2_max" => quadrature_selection.q2_cutoff,
+        )
+        if assembly_payload.kind === :fused_cuda
+            diagnostics["assembly_path"] = "fused_cuda"
+        end
         emit_event(
             "result";
             solved_count=index,
@@ -1683,62 +1783,7 @@ function solve_request_impl(request)
                     "solve_s" => Float32(t_solve),
                     "field_s" => Float32(t_field),
                 ),
-                "diagnostics" => Dict(
-                    "convergence_info" => dense_solve_report === nothing ? 0 :
-                        (dense_solve_report.fell_back ? 1 : 0),
-                    "message" => dense_solve_report === nothing ? "Julia direct dense solve" :
-                        describe_dense_solve(dense_solve_report),
-                    "dense_solve_method" => dense_solve_report === nothing ? "lu" :
-                        String(dense_solve_report.method),
-                    "dense_solve_selection" => dense_solve_report === nothing ? "fixed" :
-                        String(dense_solve_report.plan.reason),
-                    "dense_solve_fell_back" => dense_solve_report === nothing ? false :
-                        dense_solve_report.fell_back,
-                    "dense_solve_iterations" => dense_solve_report === nothing ? Int[] :
-                        dense_solve_report.iterations,
-                    "dense_solve_recent_fallback_hz" => dense_solve_report === nothing ? nothing :
-                        get(dense_solve_report.plan, :fallback_frequency_hz, nothing),
-                    "dense_solve_iteration_budget" => dense_solve_report === nothing ? nothing :
-                        dense_solve_report.iteration_budget,
-                    "dense_solve_warm_start_used" => dense_solve_report === nothing ? Bool[] :
-                        dense_solve_report.warm_start_used,
-                    "dense_solve_fallback_reason" => dense_solve_report === nothing ? nothing :
-                        dense_solve_report.fallback_reason,
-                    "dense_solve_termination_reasons" => dense_solve_report === nothing ? Symbol[] :
-                        dense_solve_report.termination_reasons,
-                    "dense_solve_tolerance" => dense_solve_report === nothing ? nothing :
-                        dense_solve_report.tolerance,
-                    "dense_solve_relative_residuals" => dense_solve_report === nothing ? Float32[] :
-                        Float32.(dense_solve_report.relative_residuals),
-                    "dense_solve_model_lu_s" => dense_solve_report === nothing ? nothing :
-                        Float32(dense_solve_report.plan.lu_model_seconds),
-                    "dense_solve_model_gmres_s" => dense_solve_report === nothing ? nothing :
-                        Float32(dense_solve_report.plan.gmres_model_seconds),
-                    "backend" => String(beat_backend),
-                    "symmetry" => symmetry_mode,
-                    "regular_assembly_mode" => string(assembly_payload.kind === :fused ?
-                        assembly_payload.system.assembly_mode :
-                        get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
-                    "blas_threads" => cpu_blas_threads,
-                    # The sweep's scheduling is now a per-solve decision, so
-                    # say which way it went: a size-aware default that reports
-                    # nothing is one whose regressions are invisible.
-                    "metal_pipeline" => metal_pipeline,
-                    "p1_dof_count" => p1_space.global_dof_count,
-                    "regular_quadrature_mode" => regular_quadrature_mode,
-                    "regular_quadrature_order" => quadrature_selection.order,
-                    "cpu_regular_kernel" => beat_backend == :cpu ? String(cpu_regular_kernel) : nothing,
-                    "cpu_singular_kernel" => assembly_payload.kind === :fused && beat_backend == :cpu ?
-                        String(assembly_payload.system.singular_kernel) : nothing,
-                    "cpu_field_kernel" => beat_backend == :cpu ? String(BeatEngineCore.beat_cpu_field_kernel()) : nothing,
-                    "regular_quadrature_base_order" => base_regular_order,
-                    "regular_quadrature_wavelength_mesh_stat" => quadrature_selection.mesh_stat,
-                    "regular_quadrature_wavelength_mesh_area_stat_m2" => quadrature_selection.mesh_area_stat,
-                    "regular_quadrature_wavelength_element_length_m" => quadrature_selection.element_length_m,
-                    "regular_quadrature_wavelength_kh" => quadrature_selection.kh,
-                    "regular_quadrature_wavelength_kh_q1_max" => quadrature_selection.q1_cutoff,
-                    "regular_quadrature_wavelength_kh_q2_max" => quadrature_selection.q2_cutoff,
-                ),
+                "diagnostics" => diagnostics,
             ),
         )
         end

@@ -5,6 +5,11 @@ using LinearAlgebra
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
 
+# The driver is the Python worker's entry point. The fused-CUDA gate below
+# drives it end to end so the opt-in path is proven through the same request
+# shape a real solve uses, not only through the assembly function directly.
+include(joinpath(@__DIR__, "..", "BeatEngineDriver.jl"))
+
 const CUDA_MODULE = try
     @eval import CUDA
     CUDA
@@ -1453,5 +1458,82 @@ end
         release_cuda_burton_miller_identity_cache!(symmetry_identity_cache)
         release_operator_storage!(symmetry_operators)
         release_cuda_image_singular_correction_cache!(image_cache)
+    end
+end
+
+@testset "cuda fused Burton-Miller driver path" begin
+    if !cuda_available()
+        @test_skip "CUDA unavailable; skipping CUDA-only BEAT Engine tests."
+    else
+        function driver_result(fused::Bool)
+            request = Dict{String,Any}(
+                "schema_version" => 2,
+                "beat_engine_backend" => "cuda",
+                "frequencies_hz" => [2000.0],
+                "config" => Dict{String,Any}(
+                    "mesh_file" => joinpath(@__DIR__, "..", "test_meshes", "sample_quarter.msh"),
+                    "scale_factor" => 0.001,
+                    "distance" => 2.0,
+                    "axial_offset" => 0.0,
+                    "step_size" => 5.0,
+                    "min_angle" => 0.0,
+                    "max_angle" => 180.0,
+                    "freq_min" => 2000.0,
+                    "freq_max" => 2000.0,
+                    "freq_count" => 1,
+                    "tag_throat" => 2,
+                    "rho" => 1.2041,
+                    "sound_speed" => 343.0,
+                    "symmetry" => "xy",
+                    "source_motion" => "normal",
+                    "quadrature_order" => 2,
+                    "singular_order" => 2,
+                    "surface_traces_enabled" => true,
+                ),
+            )
+            previous = get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", nothing)
+            try
+                if fused
+                    ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = "1"
+                else
+                    delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+                end
+                return mktempdir() do directory
+                    event_path = joinpath(directory, "events.jsonl")
+                    open(event_path, "w") do io
+                        redirect_stdout(io) do
+                            solve_request(request)
+                        end
+                    end
+                    events = [JSON.parse(line) for line in eachline(event_path) if startswith(strip(line), "{")]
+                    results = [event for event in events if get(event, "type", "") == "result"]
+                    length(results) == 1 ||
+                        error("Expected exactly one result event, got $(length(results)).")
+                    results[1]["result"]
+                end
+            finally
+                if previous === nothing
+                    delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+                else
+                    ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = previous
+                end
+            end
+        end
+
+        wire_complex(wire) = ComplexF32.(wire["real"], wire["imag"])
+
+        reference = driver_result(false)
+        fused = driver_result(true)
+
+        @test !haskey(reference["diagnostics"], "assembly_path")
+        @test get(fused["diagnostics"], "assembly_path", nothing) == "fused_cuda"
+        @test get(fused["diagnostics"], "regular_assembly_mode", nothing) == "direct_burton_miller"
+
+        reference_pressure = wire_complex(reference["surface_pressure"])
+        fused_pressure = wire_complex(fused["surface_pressure"])
+        @test isapprox(fused_pressure, reference_pressure; rtol=2f-4, atol=2f-5)
+
+        @test maximum(abs.(Float32.(fused["horizontal_spl_db"]) .- Float32.(reference["horizontal_spl_db"]))) <= 0.01f0
+        @test maximum(abs.(Float32.(fused["vertical_spl_db"]) .- Float32.(reference["vertical_spl_db"]))) <= 0.01f0
     end
 end
