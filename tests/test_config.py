@@ -93,6 +93,32 @@ def test_source_tag_reflects_velocity_sources():
     assert SolveConfig(velocity_sources={7: 1.0}).source_tag == 7
 
 
+def test_source_profile_defaults_off_and_stays_off_the_request():
+    config = SolveConfig()
+    assert config.source_profile_alpha == 0.0
+    assert "source_profile_alpha" not in _request_payload_config(config)
+
+
+def test_source_profile_requires_the_fused_cuda_path(monkeypatch):
+    monkeypatch.delenv("HORNLAB_BEAT_FUSED_BM_CUDA", raising=False)
+    with pytest.raises(NotImplementedError, match="WP16"):
+        SolveConfig(source_profile_alpha=0.5)
+    with pytest.raises(NotImplementedError, match="HORNLAB_BEAT_FUSED_BM_CUDA"):
+        SolveConfig(source_profile_alpha=0.5, beat_backend="cuda")
+    with pytest.raises(NotImplementedError, match="WP16"):
+        SolveConfig(source_profile_alpha=0.5, beat_backend="cpu")
+
+
+def test_source_profile_rides_the_request_when_the_fused_path_is_requested(monkeypatch):
+    monkeypatch.setenv("HORNLAB_BEAT_FUSED_BM_CUDA", "1")
+    config = SolveConfig(source_profile_alpha=0.5, beat_backend="cuda")
+    assert _request_payload_config(config)["source_profile_alpha"] == 0.5
+    with pytest.raises(NotImplementedError, match="WP16"):
+        SolveConfig(source_profile_alpha=0.5)
+    with pytest.raises(ValueError, match="finite"):
+        SolveConfig(source_profile_alpha=float("nan"), beat_backend="cuda")
+
+
 @pytest.mark.parametrize("backend", ["cpu", "cuda", "rocm", "metal"])
 def test_solve_config_accepts_every_declared_backend(backend):
     assert SolveConfig(beat_backend=backend).beat_backend == backend

@@ -172,6 +172,9 @@ def _request_payload(
         "quadrature_order": int(config.quadrature_order),
         "singular_order": int(config.singular_order),
     }
+    # WP16: opt-in, so the default request stays byte-for-byte the old one.
+    if config.source_profile_alpha != 0.0:
+        solver_config["source_profile_alpha"] = float(config.source_profile_alpha)
     if ground_plane_enabled(config):
         # The half-space containment guard lives in the Julia driver, because
         # only it sees the mesh after loading, scaling and translation.

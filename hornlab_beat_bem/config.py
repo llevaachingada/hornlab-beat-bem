@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import isfinite
@@ -340,6 +341,23 @@ class SolveConfig:
     velocity_sources: dict[int, float] = field(default_factory=lambda: {2: 1.0})
     source_motion: str = "normal"
 
+    #: WP16 opt-in phase-plug-like exit profile, applied per source face as
+    #: ``v(r) = 1 + alpha * J0(j01 * r / r0)`` and normalised so the tag's
+    #: total volume velocity is exactly the uniform case's. ``r`` is the
+    #: source-face centroid's distance from the solver axis, ``r0`` the source
+    #: tag's equivalent radius (``pi*r0^2`` is the tag area, times the symmetry
+    #: reduction) and ``j01`` the first zero of J0. ``0.0`` (the default)
+    #: reproduces today's uniform drive bit-for-bit and puts no key on the
+    #: request.
+    #:
+    #: **Fused CUDA path only.** Every other path would report a profile the
+    #: assembly never applied, so a non-zero value is refused unless the
+    #: backend is CUDA and the worker inherits
+    #: ``HORNLAB_BEAT_FUSED_BM_CUDA=1``. The Julia driver re-checks the path it
+    #: actually ran and refuses otherwise; see ``_assert_cuda_fused_path`` in
+    #: hornlab-search for the consumer-side proof.
+    source_profile_alpha: float = 0.0
+
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     #: Optional explicit frame; must be axis-aligned (+z axis). When set, the
@@ -459,6 +477,27 @@ class SolveConfig:
             )
         if self.source_motion not in {"normal", "axial"}:
             raise ValueError("source_motion must be 'normal' or 'axial'")
+        try:
+            source_profile_alpha = float(self.source_profile_alpha)
+        except (TypeError, ValueError, OverflowError):
+            source_profile_alpha = float("nan")
+        if not isfinite(source_profile_alpha):
+            raise ValueError("source_profile_alpha must be finite")
+        self.source_profile_alpha = source_profile_alpha
+        if source_profile_alpha != 0.0:
+            fused_cuda_requested = (
+                self.beat_backend == BEAT_CUDA
+                and os.environ.get("HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1"
+            )
+            if not fused_cuda_requested:
+                raise NotImplementedError(
+                    "WP16: profile source implemented on the fused path only "
+                    "(branch work in progress): source_profile_alpha="
+                    f"{source_profile_alpha!r} needs beat_backend='cuda' and "
+                    "HORNLAB_BEAT_FUSED_BM_CUDA=1 in the environment the Julia "
+                    "worker inherits; every other path would assemble the "
+                    "uniform drive and report a profile it never applied"
+                )
         if not isinstance(self.velocity_sources, dict) or len(self.velocity_sources) != 1:
             raise NotImplementedError(
                 "hornlab-beat-bem supports exactly one velocity source tag"

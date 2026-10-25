@@ -1537,3 +1537,207 @@ end
         @test maximum(abs.(Float32.(fused["vertical_spl_db"]) .- Float32.(reference["vertical_spl_db"]))) <= 0.01f0
     end
 end
+
+@testset "WP16 radial source profile" begin
+    mesh = load_gmsh22_with_tags(
+        joinpath(@__DIR__, "..", "test_meshes", "sample_quarter.msh"), Float32(1.0),
+    )
+    element_mesh_ids = ones(Int, length(mesh.faces))
+    radiators = [Dict{String,Any}(
+        "name" => "Radiator",
+        "tag" => 2,
+        "mesh_id" => 1,
+        "channel" => "main",
+        "velocity_offset_db" => 0.0,
+    )]
+    rho = Float32(1.2041)
+    omega = Float32(2pi * 2000.0)
+    source_indices = findall(==(2), mesh.physical_tags)
+    tag_area = sum(Float64(mesh.areas[index]) for index in source_indices)
+
+    @test bessel_j0(0.0) == 1.0
+    @test bessel_j0(1.0) ≈ 0.7651976865579666 rtol = 1e-14
+    @test bessel_j0(2.0) ≈ 0.2238907791412357 rtol = 1e-13
+    @test bessel_j0(3.0) ≈ -0.2600519549019334 rtol = 1e-12
+    @test abs(bessel_j0(J0_FIRST_ZERO)) <= 1e-14
+
+    columns = channel_neumann_columns(
+        mesh, element_mesh_ids, radiators, ["main"], rho, omega, Float32;
+        source_motion=:normal,
+    )
+    reference = zeros(ComplexF32, length(mesh.faces), 1)
+    for element_index in source_indices
+        reference[element_index, 1] = ComplexF32(0, rho * omega)
+    end
+    @test columns == reference
+
+    @test source_profile_factors(
+        mesh, element_mesh_ids, radiators, Float32, 0.0; symmetry_mode=:xy,
+    ) === nothing
+
+    alpha = 0.5
+    profile = source_profile_factors(
+        mesh, element_mesh_ids, radiators, Float32, alpha; symmetry_mode=:xy,
+    )
+    @test profile !== nothing
+    @test profile.face_count == length(source_indices)
+    # pi*r0^2 is the tag's full-cap area (the quarter mesh's tag is one sector).
+    @test profile.r0 ≈ sqrt(4 * tag_area / pi) rtol = 1e-12
+    @test profile.r0 ≈ 12.7 rtol = 2e-2
+
+    axis = zeros(3)
+    for element_index in source_indices
+        axis .+= collect(Float64.(mesh.normals[element_index])) .* Float64(mesh.areas[element_index])
+    end
+    axis ./= norm(axis)
+    for element_index in eachindex(mesh.physical_tags)
+        if mesh.physical_tags[element_index] == 2
+            centroid = collect(Float64.(mesh.centroids[element_index]))
+            radius = norm(centroid .- dot(centroid, axis) .* axis)
+            expected = profile.scale * (
+                1.0 + alpha * bessel_j0(J0_FIRST_ZERO * radius / profile.r0)
+            )
+            @test profile.factors[element_index] ≈ Float32(expected) rtol = 1e-6
+        else
+            @test profile.factors[element_index] == 0
+        end
+    end
+
+    sampled = [profile.factors[index] for index in source_indices]
+    @test maximum(sampled) > minimum(sampled)
+
+    volume_velocity = sum(
+        Float64(mesh.areas[index]) * Float64(profile.factors[index])
+        for index in eachindex(mesh.faces)
+    )
+    @test volume_velocity ≈ tag_area rtol = 1e-5
+
+    @test require_source_profile_path(0.0, false) === nothing
+    @test require_source_profile_path(0.5, true) === nothing
+    refusal = try
+        require_source_profile_path(0.5, false)
+        nothing
+    catch err
+        err
+    end
+    @test refusal isa ErrorException
+    @test occursin("WP16: profile source implemented on the fused path only", refusal.msg)
+    @test occursin("HORNLAB_BEAT_FUSED_BM_CUDA=1", refusal.msg)
+
+    @test isempty(source_profile_diagnostics(0.0, 0, :operators))
+    proven = source_profile_diagnostics(0.4, length(source_indices), :fused_cuda)
+    @test proven["source_profile"] == "j0_radial"
+    @test proven["source_profile_path"] == "fused_cuda"
+    @test proven["source_profile_alpha"] == 0.4
+    @test proven["source_profile_face_count"] == length(source_indices)
+    @test proven["assembly_path"] == "fused_cuda"
+    @test_throws ErrorException source_profile_diagnostics(0.4, length(source_indices), :fused)
+
+    # The refusal is the driver's, not only the Python config's: a CPU request
+    # that names a profile fails before the mesh is read.
+    cpu_request = Dict{String,Any}(
+        "schema_version" => 2,
+        "beat_engine_backend" => "cpu",
+        "frequencies_hz" => [2000.0],
+        "config" => Dict{String,Any}("source_profile_alpha" => 0.5),
+    )
+    @test_throws ErrorException redirect_stdout(devnull) do
+        solve_request(cpu_request)
+    end
+
+    # Non-fused CUDA is refused too, without needing a device: the gate runs
+    # before the backend is touched.
+    cuda_request = Dict{String,Any}(
+        "schema_version" => 2,
+        "beat_engine_backend" => "cuda",
+        "frequencies_hz" => [2000.0],
+        "config" => Dict{String,Any}("source_profile_alpha" => 0.5),
+    )
+    previous = get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", nothing)
+    try
+        delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+        @test_throws ErrorException redirect_stdout(devnull) do
+            solve_request(cuda_request)
+        end
+    finally
+        if previous === nothing
+            delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+        else
+            ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = previous
+        end
+    end
+end
+
+@testset "cuda fused WP16 source profile driver path" begin
+    if !cuda_available()
+        @test_skip "CUDA unavailable; skipping CUDA-only BEAT Engine tests."
+    else
+        function profile_driver_result(alpha)
+            request = Dict{String,Any}(
+                "schema_version" => 2,
+                "beat_engine_backend" => "cuda",
+                "frequencies_hz" => [2000.0],
+                "config" => Dict{String,Any}(
+                    "mesh_file" => joinpath(@__DIR__, "..", "test_meshes", "sample_quarter.msh"),
+                    "scale_factor" => 0.001,
+                    "distance" => 2.0,
+                    "axial_offset" => 0.0,
+                    "step_size" => 5.0,
+                    "min_angle" => 0.0,
+                    "max_angle" => 180.0,
+                    "freq_min" => 2000.0,
+                    "freq_max" => 2000.0,
+                    "freq_count" => 1,
+                    "tag_throat" => 2,
+                    "rho" => 1.2041,
+                    "sound_speed" => 343.0,
+                    "symmetry" => "xy",
+                    "source_motion" => "normal",
+                    "quadrature_order" => 2,
+                    "singular_order" => 2,
+                    "surface_traces_enabled" => true,
+                    "source_profile_alpha" => alpha,
+                ),
+            )
+            previous = get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", nothing)
+            try
+                ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = "1"
+                return mktempdir() do directory
+                    event_path = joinpath(directory, "events.jsonl")
+                    open(event_path, "w") do io
+                        redirect_stdout(io) do
+                            solve_request(request)
+                        end
+                    end
+                    events = [JSON.parse(line) for line in eachline(event_path) if startswith(strip(line), "{")]
+                    results = [event for event in events if get(event, "type", "") == "result"]
+                    length(results) == 1 ||
+                        error("Expected exactly one result event, got $(length(results)).")
+                    results[1]["result"]
+                end
+            finally
+                if previous === nothing
+                    delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+                else
+                    ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = previous
+                end
+            end
+        end
+
+        uniform = profile_driver_result(0.0)
+        profiled = profile_driver_result(0.5)
+
+        @test !haskey(uniform["diagnostics"], "source_profile")
+        @test profiled["diagnostics"]["assembly_path"] == "fused_cuda"
+        @test profiled["diagnostics"]["source_profile"] == "j0_radial"
+        @test profiled["diagnostics"]["source_profile_path"] == "fused_cuda"
+        @test profiled["diagnostics"]["source_profile_alpha"] == 0.5
+        @test profiled["diagnostics"]["source_profile_face_count"] > 0
+        @test all(isfinite, Float32.(profiled["horizontal_spl_db"]))
+        @test all(isfinite, Float32.(profiled["vertical_spl_db"]))
+
+        uniform_pressure = ComplexF32.(uniform["surface_pressure"]["real"], uniform["surface_pressure"]["imag"])
+        profiled_pressure = ComplexF32.(profiled["surface_pressure"]["real"], profiled["surface_pressure"]["imag"])
+        @test !isapprox(profiled_pressure, uniform_pressure; rtol=0, atol=1e-9)
+    end
+end

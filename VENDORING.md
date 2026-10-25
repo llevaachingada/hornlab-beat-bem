@@ -681,6 +681,18 @@ unchanged through the 2026-10-01 re-sync, also differ from the sync commit:
   on the wire, and the option is refused on accelerator backends.
 - **Surface traces**: `surface_pressure` / `surface_neumann` outputs of the
   mixed boundary solution when requested.
+- **Fused CUDA Burton-Miller assembly** (`fa99ee5`): opt-in
+  `HORNLAB_BEAT_FUSED_BM_CUDA=1` routes CUDA requests through the
+  single-matrix assembler instead of four operators, and reports
+  `diagnostics.assembly_path = "fused_cuda"`. Off by default; the default CUDA
+  path is unchanged.
+- **WP16 radial source profile**: opt-in `source_profile_alpha` request key
+  driving each source face with
+  `1 + alpha*J0(j01*r/r0)`, renormalised so the tag's total volume velocity
+  matches the uniform drive. Implemented only in the fused CUDA source
+  handling; every other path refuses a non-zero value, and the result's
+  diagnostics carry `source_profile_path = "fused_cuda"`. Zero (the default)
+  reproduces the uniform source vector bit-for-bit.
 
 ### `hornlab_beat_bem/julia_cuda/{Project,Manifest}.toml`
 

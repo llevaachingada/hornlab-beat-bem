@@ -351,8 +351,18 @@ against the exact source-plus-image solution, and case 4 scores the reported
 entirely correct. See [Validation](#validation).
 
 Supported: diagonal observation cuts, spherical balloon/DI grids (theta-major,
-so WG's DI integration and 3D balloon both work), axial source motion, and
-surface trace retention (`SolveConfig.surface_traces`, off by default).
+so WG's DI integration and 3D balloon both work), axial source motion, an
+opt-in radial source profile on the fused CUDA path, and surface trace
+retention (`SolveConfig.surface_traces`, off by default).
+
+`SolveConfig.source_profile_alpha` (default `0.0`) drives the source tag with
+`v(r) = 1 + alpha * J0(j01 * r / r0)` sampled per source face and renormalised
+so the tag's total volume velocity is the uniform case's. It is **branch work
+in progress on the fused CUDA path only**: a non-zero value is refused unless
+the backend is CUDA and the worker inherits
+`HORNLAB_BEAT_FUSED_BM_CUDA=1`, and the Julia driver refuses any path that did
+not actually run the fused assembler. `alpha = 0` is the default and leaves the
+request and the source vector byte-for-byte unchanged.
 
 Not supported: multi-source drive -- exactly one velocity source tag at unit
 amplitude -- WG's y-only `xz` half domain, per the symmetry note above, a
@@ -871,6 +881,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
+| `HORNLAB_BEAT_FUSED_BM_CUDA` | — | `1` routes CUDA Burton-Miller assembly through the single-matrix fused assembler; required by `SolveConfig.source_profile_alpha` |
 | `BLAB_BEAT_CPU_REGULAR_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores the regular-pair arithmetic |
 | `BLAB_BEAT_CPU_SINGULAR_KERNEL` | `simd` | CPU source-request driver, fused Burton-Miller only; `scalar` restores the Duffy loop |
 | `BLAB_BEAT_CPU_FIELD_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores field evaluation |

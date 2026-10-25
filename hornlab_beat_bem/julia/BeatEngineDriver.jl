@@ -804,6 +804,165 @@ function channel_neumann_columns(
     return columns
 end
 
+#: j01 -- the first zero of the Bessel function of the first kind, order zero:
+#: J0(j01) = 0. WP16's radial source profile is
+#: `1 + alpha*J0(j01*r/r0)`, so this number is part of the profile's
+#: definition rather than a tuning knob: it makes the profile fall back to 1 at
+#: the source rim (r = r0) and peak at the axis (1 + alpha).
+const J0_FIRST_ZERO = 2.4048255576957728
+
+"""
+    bessel_j0(x) -> Float64
+
+Bessel function `J0(x)` by its alternating power series,
+
+    J0(x) = sum_k (-1)^k (x/2)^(2k) / (k!)^2.
+
+WP16 only needs `x = j01*r/r0`, which is O(1) over the source tag, so the
+series converges in a few terms and its cancellation is harmless. It is
+implemented here rather than pulled in from SpecialFunctions because the
+profile is the package's only Bessel use, and a dependency would change every
+backend's project and manifest for one function.
+"""
+function bessel_j0(x::Real)
+    xf = Float64(x)
+    half_squared = (xf / 2)^2
+    term = 1.0
+    total = 1.0
+    for k in 1:200
+        term *= -half_squared / (k * k)
+        total += term
+        abs(term) <= eps(Float64) * abs(total) && break
+    end
+    return total
+end
+
+"""
+    source_profile_factors(mesh, element_mesh_ids, radiators, ::Type{T}, alpha;
+                           symmetry_mode=:off)
+
+Per-face normal-velocity multipliers for the WP16 opt-in source profile, or
+`nothing` when `alpha == 0` -- the default, which must leave the uniform drive
+bit-for-bit unchanged.
+
+The profile is sampled at each source face's centroid:
+
+    v(r) = 1 + alpha * J0(j01 * r / r0)
+
+where `r` is the centroid's distance from the solver axis (the line through the
+coordinate origin along the source tag's area-weighted mean normal) and `r0` is
+the tag's equivalent radius, `pi*r0^2 = A_tag`. Under a symmetry reduction the
+tag is one sector of the cap, so `A_tag` is scaled by the symmetry reduction
+factor to recover the full cap's radius; that keeps the same physical profile
+whether the mesh is a full cap or a quadrant of one.
+
+Normalisation is over the tag, not per face: the fused assembler carries one
+DP0 value per face, so a profile sampled per face is the only representation
+that survives on that path. The scale `A_tag / sum(A_i * v(r_i))` makes
+
+    sum_i A_i * v(r_i) = A_tag
+
+exactly -- the same total volume velocity as the uniform `v = 1` drive -- up to
+the summation's own rounding. `alpha = 0` returns `nothing` before any of this
+runs, so the default source vector is today's, bit-for-bit.
+"""
+function source_profile_factors(
+    mesh,
+    element_mesh_ids,
+    radiators,
+    ::Type{T},
+    alpha::Real;
+    symmetry_mode::Symbol=:off,
+) where {T<:AbstractFloat}
+    Float64(alpha) == 0.0 && return nothing
+
+    source_faces = Int[]
+    for element_index in eachindex(mesh.physical_tags)
+        for radiator in radiators
+            if mesh.physical_tags[element_index] == Int(radiator["tag"]) &&
+               radiator_owns_element(radiator, element_mesh_ids, element_index)
+                push!(source_faces, element_index)
+                break
+            end
+        end
+    end
+    isempty(source_faces) && return nothing
+
+    total_area = sum(Float64(mesh.areas[element_index]) for element_index in source_faces)
+    total_area > 0.0 || return nothing
+
+    axis = zeros(3)
+    for element_index in source_faces
+        axis .+= collect(Float64.(mesh.normals[element_index])) .* Float64(mesh.areas[element_index])
+    end
+    axis_length = norm(axis)
+    axis_length > 0.0 || return nothing
+    axis ./= axis_length
+
+    radii = Vector{Float64}(undef, length(source_faces))
+    for (position, element_index) in enumerate(source_faces)
+        centroid = collect(Float64.(mesh.centroids[element_index]))
+        centroid .-= dot(centroid, axis) .* axis
+        radii[position] = norm(centroid)
+    end
+
+    reduction = symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode)
+    r0 = sqrt(reduction * total_area / pi)
+    r0 > 0.0 || return nothing
+
+    profile = [1.0 + Float64(alpha) * bessel_j0(J0_FIRST_ZERO * radii[position] / r0)
+               for position in eachindex(radii)]
+    weighted_area = sum(
+        Float64(mesh.areas[source_faces[position]]) * profile[position]
+        for position in eachindex(profile)
+    )
+    weighted_area > 0.0 || return nothing
+    scale = total_area / weighted_area
+
+    factors = zeros(T, length(mesh.faces))
+    for (position, element_index) in enumerate(source_faces)
+        factors[element_index] = T(scale * profile[position])
+    end
+    return (factors=factors, face_count=length(source_faces), r0=r0, scale=scale)
+end
+
+"""
+    require_source_profile_path(alpha, fused_cuda)
+
+WP16's profile is implemented in the fused CUDA assembler's source handling and
+nowhere else. A non-zero `alpha` on any other path is refused before assembly,
+because the alternative is a request that reports a profile the solve never
+applied. `alpha == 0` is the default path and is never refused.
+"""
+function require_source_profile_path(alpha::Real, fused_cuda::Bool)
+    Float64(alpha) == 0.0 && return nothing
+    fused_cuda && return nothing
+    error(
+        "WP16: profile source implemented on the fused path only (branch work " *
+        "in progress); source_profile_alpha=$(Float64(alpha)) requires the fused " *
+        "CUDA Burton-Miller assembler (HORNLAB_BEAT_FUSED_BM_CUDA=1, backend " *
+        "cuda, no near-correction, symmetry other than ground)",
+    )
+end
+
+"""
+    source_profile_diagnostics(alpha, face_count, assembly_kind) -> Dict
+
+The diagnostics that PROVE the WP16 profile ran where it claims. Empty when
+`alpha == 0`, so the default result carries exactly the keys it did before.
+"""
+function source_profile_diagnostics(alpha::Real, face_count::Integer, assembly_kind::Symbol)
+    Float64(alpha) == 0.0 && return Dict{String,Any}()
+    require_source_profile_path(alpha, assembly_kind === :fused_cuda)
+    return Dict{String,Any}(
+        "source_profile" => "j0_radial",
+        "source_profile_alpha" => Float64(alpha),
+        "source_profile_path" => "fused_cuda",
+        "source_profile_face_count" => Int(face_count),
+        "assembly_path" => "fused_cuda",
+    )
+end
+
 #: Smallest P1 dof count at which overlapping the sweep pays by default.
 #:
 #: The overlap buys the CPU solve it hides behind the next frequency's GPU
@@ -1134,6 +1293,23 @@ function solve_request_impl(request)
     source_motion = Symbol(lowercase(strip(String(get_value(config, "source_motion", "normal")))))
     source_motion in (:normal, :axial) || error("Unsupported source_motion: $(source_motion). Expected normal or axial.")
 
+    # WP16: opt-in, and absent by default so a request without the key takes
+    # exactly the path it took before. Refused here, before the mesh loads or
+    # any worker is warmed, when the only implementation (the fused CUDA source
+    # handling) cannot run; re-checked against the real fused decision below.
+    source_profile_alpha = Float64(get_value(config, "source_profile_alpha", 0.0))
+    isfinite(source_profile_alpha) ||
+        error("source_profile_alpha must be finite, got $(source_profile_alpha).")
+    source_profile_requested = source_profile_alpha != 0.0
+    if source_profile_requested
+        require_source_profile_path(
+            source_profile_alpha,
+            beat_backend == :cuda &&
+            get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1" &&
+            Symbol(symmetry_mode) != :ground,
+        )
+    end
+
     # BEAT assembles and solves in Float32 because that is what its CUDA and
     # ROCm kernels are written for. The CPU path is generic in the element
     # type, so it can run the same solve in Float64 -- which is what makes it
@@ -1232,6 +1408,10 @@ function solve_request_impl(request)
         near_selection === nothing &&
         get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1" &&
         Symbol(symmetry_mode) != :ground
+    # The early gate above could not see near-correction (it needs the mesh);
+    # this one sees the decision the solve will actually take.
+    require_source_profile_path(source_profile_alpha, fused_burton_miller_cuda)
+    source_profile_face_count = 0
     near_correction_cache = nothing
     image_near_correction_caches = nothing
     device_near_correction_cache = nothing
@@ -1491,6 +1671,18 @@ function solve_request_impl(request)
                 )
                 size(fused_q_columns, 2) == 1 ||
                     error("HORNLAB_BEAT_FUSED_BM_CUDA supports exactly one channel")
+                if source_profile_requested
+                    profile = source_profile_factors(
+                        mesh, element_mesh_ids, radiators, FloatType, source_profile_alpha;
+                        symmetry_mode=Symbol(symmetry_mode),
+                    )
+                    if profile !== nothing
+                        # Factors are per face and this path is one channel; the
+                        # reshape keeps the broadcast an m-vector, not m-by-m.
+                        fused_q_columns .*= reshape(profile.factors, :, 1)
+                        source_profile_face_count = profile.face_count
+                    end
+                end
                 d_q = BeatEngineCore.CUDA_MODULE.CuArray(fused_q_columns[:, 1])
                 cuda_system = BeatEngineCore.assemble_burton_miller_neumann_system_cuda(
                     mesh, p1_space, dp0_space, d_q, k, selected_rule;
@@ -1756,6 +1948,17 @@ function solve_request_impl(request)
         )
         if assembly_payload.kind === :fused_cuda
             diagnostics["assembly_path"] = "fused_cuda"
+        end
+        if source_profile_requested
+            # Empty when alpha is zero, so the default result keeps exactly the
+            # keys it had. When it is not, these fields name the path that ran;
+            # the consumer refuses a profile solve whose proof is absent.
+            merge!(
+                diagnostics,
+                source_profile_diagnostics(
+                    source_profile_alpha, source_profile_face_count, assembly_payload.kind,
+                ),
+            )
         end
         emit_event(
             "result";
