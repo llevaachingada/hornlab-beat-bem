@@ -34,6 +34,7 @@ from .config import (
     reject_unrepresentable_observation_origin,
     reject_unsupported_ground_plane,
     reject_unsupported_native_symmetry,
+    reject_unsupported_near_correction,
 )
 from .mesh import read_gmsh22_info
 from .result import SolveResult
@@ -256,6 +257,9 @@ def solve_frequencies(
 
     reject_unsupported_native_symmetry(config)
     reject_unsupported_ground_plane(config)
+    # Re-checked here so a config mutated after construction cannot reach a
+    # backend that would accept the flag and never apply the correction.
+    reject_unsupported_near_correction(config)
     reject_unrepresentable_observation_origin(config)
     frequencies = np.asarray(list(frequencies_hz), dtype=np.float64)
     if frequencies.size == 0:

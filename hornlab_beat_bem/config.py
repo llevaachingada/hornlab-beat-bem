@@ -60,12 +60,23 @@ SUPPORTED_QUADRATURE_ORDERS: tuple[int, ...] = (1, 2, 4)
 #: not, because no machine available to this project has an NVIDIA GPU, so the
 #: change could not be executed or measured. Lift that one once someone with
 #: the hardware ports and validates it.
+#:
+#: WP17 lifts it for exactly one staged case -- the fused CUDA Burton-Miller
+#: assembler, with no symmetry reduction at all. That path needs no image-near
+#: cache, so the multi-image hazard cannot arise; every other CUDA combination
+#: (four-operator assembly, native symmetry, a ground plane) keeps this refusal
+#: verbatim. The report still declares CUDA ``near_pair`` unsupported because
+#: availability is conditional on both an environment variable and the solve
+#: shape, and a capability report is a statement about the default contract.
 NEAR_CORRECTION_REFUSALS: dict[str, str] = {
     BEAT_CUDA: (
         "the CUDA device path carries a single image-near cache, so under a "
         "multi-image symmetry two of three mirror transforms would integrate "
         "a near-singular kernel with the plain regular rule and say nothing "
-        "about it; refused rather than silently wrong"
+        "about it; refused rather than silently wrong. WP17 lifts this only on "
+        "the fused CUDA Burton-Miller path with no symmetry reduction "
+        "(HORNLAB_BEAT_FUSED_BM_CUDA=1, native_symmetry_plane=None, no ground "
+        "plane); symmetry on this path is stage 2 and remains refused"
     ),
     BEAT_ROCM: (
         "the vendored ROCm assembly has no near-pair kernel at all, so the "
@@ -414,8 +425,16 @@ class SolveConfig:
     #: ratio (Bernstein-ellipse convergence), floored at 4 and capped at
     #: ``near_correction_order``. Under a symmetry mode it also covers
     #: mirror-image pairs, one cache per image transform. Off reproduces the
-    #: uncorrected solve bit-for-bit. **CPU only** -- see
-    #: ``NEAR_CORRECTION_REFUSALS`` for why every accelerator refuses it.
+    #: uncorrected solve bit-for-bit.
+    #:
+    #: **CPU, plus one staged CUDA case.** Every accelerator keeps the refusal
+    #: in ``NEAR_CORRECTION_REFUSALS`` except the fused CUDA Burton-Miller path
+    #: with no symmetry reduction: ``beat_backend="cuda"``,
+    #: ``HORNLAB_BEAT_FUSED_BM_CUDA=1``, ``native_symmetry_plane=None`` and no
+    #: enabled ground plane. That combination has no image pairs, so the
+    #: single-image-cache hazard the refusal exists for cannot arise. A
+    #: symmetric or non-fused CUDA request is still refused; symmetry is
+    #: stage 2.
     near_correction: bool = False
     near_correction_cutoff: float = 2.0
     near_correction_order: int = 8
@@ -566,16 +585,12 @@ class SolveConfig:
         self.near_correction_order = int(self.near_correction_order)
         # One table, read here and by the capability report, so the published
         # contract and the refusal cannot drift. Each backend's reason is in
-        # NEAR_CORRECTION_REFUSALS above; all three accelerators are refused at
-        # construction rather than at solve time, so a caller learns before a
-        # worker is started.
-        near_refusal = NEAR_CORRECTION_REFUSALS.get(self.beat_backend)
-        if self.near_correction and near_refusal is not None:
-            label = _BACKEND_LABELS[self.beat_backend]
-            raise NotImplementedError(
-                f"near_correction is not implemented for the BEAT {label} "
-                f"backend: {near_refusal}"
-            )
+        # NEAR_CORRECTION_REFUSALS above; every refused combination is refused
+        # at construction rather than at solve time, so a caller learns before
+        # a worker is started. WP17's single staged exception is resolved in
+        # the helper, and sweep.solve_frequencies re-checks it for a config
+        # mutated after construction.
+        reject_unsupported_near_correction(self)
         if not isinstance(self.surface_traces, bool):
             raise ValueError("surface_traces must be a bool")
         if self.solve_precision not in {"single", "double"}:
@@ -665,6 +680,101 @@ def ground_plane_enabled(config: SolveConfig) -> bool:
     """Whether this solve actually stands the body next to a rigid boundary."""
 
     return config.ground_plane is not None and config.ground_plane.enabled
+
+
+def _cuda_near_correction_stage_refusal(config: SolveConfig) -> str | None:
+    """Why a CUDA near-correction request is outside WP17's staged exception.
+
+    ``None`` means the combination is the one staged case: the fused CUDA
+    Burton-Miller assembler (requested through the same environment variable
+    WP16 uses) with no symmetry reduction. The caller only reaches this for a
+    CUDA config that already asked for ``near_correction``.
+
+    Each refusal names the missing half of the rule rather than repeating the
+    table, because the table's own text is appended by the caller. The two
+    image cases are the silent-wrong hazard verbatim: the fused CUDA assembler
+    takes one identity near cache, so a mirror or ground image would be
+    integrated by the plain regular rule with nothing said about it.
+    """
+
+    if os.environ.get("HORNLAB_BEAT_FUSED_BM_CUDA", "0") != "1":
+        return (
+            "the fused CUDA Burton-Miller path was not requested; without "
+            "HORNLAB_BEAT_FUSED_BM_CUDA=1 the solve would take the "
+            "four-operator CUDA path, whose near caches are unvalidated here"
+        )
+    if config.native_symmetry_plane is not None:
+        return (
+            f"native_symmetry_plane={config.native_symmetry_plane!r} is a "
+            "multi-image symmetry and the fused CUDA assembler carries only "
+            "one identity near cache; symmetry is stage 2 and is not "
+            "available yet"
+        )
+    if ground_plane_enabled(config):
+        return (
+            "an enabled ground plane images every face against the rigid "
+            "boundary, so the same single-image near cache is insufficient; "
+            "the fused CUDA path does not run on the ground image"
+        )
+    return None
+
+
+def fused_cuda_near_correction_allowed(config: SolveConfig) -> bool:
+    """Whether this config is WP17's one staged CUDA near-correction case.
+
+    A predicate of the config and the inherited environment, and the same one
+    the refusal reads, exported so a caller (or a test) can ask the question
+    without provoking an exception. It mirrors the Julia driver's
+    ``fused_cuda_near_correction_permitted``: CUDA, the fused path requested,
+    no native symmetry, no ground plane.
+    """
+
+    return (
+        config.near_correction
+        and config.beat_backend == BEAT_CUDA
+        and _cuda_near_correction_stage_refusal(config) is None
+    )
+
+
+def reject_unsupported_near_correction(config: SolveConfig) -> None:
+    """Refuse near correction wherever no path would actually apply it.
+
+    The table in ``NEAR_CORRECTION_REFUSALS`` is the published contract and is
+    read here rather than restated, so the capability report and the refusal
+    cannot drift. CPU is absent from the table because it is supported.
+
+    WP17 is the one exception, and it is narrow on purpose. The CUDA entry is
+    still in the table -- the mixed-image hazard in its text is real -- but the
+    fused CUDA Burton-Miller assembler with **no** image transforms is allowed,
+    because that path applies one identity near cache and there is no second
+    transform to leave uncorrected. Everything else keeps the refusal,
+    including a non-fused CUDA request and a fused request with a native
+    symmetry plane or a ground plane.
+    """
+
+    if not config.near_correction:
+        return
+    refusal = NEAR_CORRECTION_REFUSALS.get(config.beat_backend)
+    if refusal is None:
+        return
+
+    if config.beat_backend == BEAT_CUDA:
+        stage_refusal = _cuda_near_correction_stage_refusal(config)
+        if stage_refusal is None:
+            return
+        raise NotImplementedError(
+            "near_correction on the BEAT CUDA backend is available only on "
+            "the fused CUDA Burton-Miller path with no symmetry reduction "
+            "(HORNLAB_BEAT_FUSED_BM_CUDA=1, native_symmetry_plane=None, no "
+            f"ground plane): {stage_refusal}. The standing reason CUDA was "
+            f"refused for every other configuration still applies: {refusal}"
+        )
+
+    label = _BACKEND_LABELS[config.beat_backend]
+    raise NotImplementedError(
+        f"near_correction is not implemented for the BEAT {label} "
+        f"backend: {refusal}"
+    )
 
 
 def reject_unsupported_ground_plane(config: SolveConfig) -> None:

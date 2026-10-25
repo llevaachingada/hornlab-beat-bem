@@ -13,6 +13,7 @@ runner.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +184,27 @@ UNEXERCISABLE_REFUSALS: dict[str, str] = {
     ),
 }
 
+def _assert_near_correction_refused(backend: str, config) -> None:
+    """Walk the CUDA near-correction refusal in the default environment.
+
+    WP17 makes CUDA's answer depend on ``HORNLAB_BEAT_FUSED_BM_CUDA``; the
+    capability report is a statement about the default contract, so the walk is
+    hermetic rather than inheriting whatever a developer has exported. The
+    staged allowance has its own tests in ``tests/test_config.py``.
+    """
+
+    previous = os.environ.pop("HORNLAB_BEAT_FUSED_BM_CUDA", None)
+    try:
+        _assert_raises(
+            f"{backend}: near_correction",
+            NotImplementedError,
+            lambda: config(near_correction=True),
+        )
+    finally:
+        if previous is not None:
+            os.environ["HORNLAB_BEAT_FUSED_BM_CUDA"] = previous
+
+
 #: Exercisers for refusals the report spells as ``supported: False`` with a
 #: reason, keyed by the path :func:`_declared_refusal_paths` collects. A path
 #: with no entry here must be excused in :data:`UNEXERCISABLE_REFUSALS`; the
@@ -192,11 +214,7 @@ UNEXERCISABLE_REFUSALS: dict[str, str] = {
 #: rather than by a hand-written branch -- the pattern this case exists to
 #: enforce, and the recorded verified path is then one the report declares.
 _UNSUPPORTED_FEATURE_CHECKS: dict[str, Any] = {
-    "quadrature.near_pair": lambda backend, config: _assert_raises(
-        f"{backend}: near_correction",
-        NotImplementedError,
-        lambda: config(near_correction=True),
-    ),
+    "quadrature.near_pair": _assert_near_correction_refused,
 }
 
 #: Orders the walk feeds ``quadrature_order`` to prove the refusal bites. 6 is

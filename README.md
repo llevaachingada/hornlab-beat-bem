@@ -352,8 +352,9 @@ entirely correct. See [Validation](#validation).
 
 Supported: diagonal observation cuts, spherical balloon/DI grids (theta-major,
 so WG's DI integration and 3D balloon both work), axial source motion, an
-opt-in radial source profile on the fused CUDA path, and surface trace
-retention (`SolveConfig.surface_traces`, off by default).
+opt-in radial source profile on the fused CUDA path, near-singular correction
+on the CPU and, staged, on the fused CUDA path without symmetry, and surface
+trace retention (`SolveConfig.surface_traces`, off by default).
 
 `SolveConfig.source_profile_alpha` (default `0.0`) drives the source tag with
 `v(r) = 1 + alpha * J0(j01 * r / r0)` sampled per source face and renormalised
@@ -363,6 +364,14 @@ the backend is CUDA and the worker inherits
 `HORNLAB_BEAT_FUSED_BM_CUDA=1`, and the Julia driver refuses any path that did
 not actually run the fused assembler. `alpha = 0` is the default and leaves the
 request and the source vector byte-for-byte unchanged.
+
+`SolveConfig.near_correction` (default `False`) is the CPU correction, plus the
+one staged CUDA case: `beat_backend="cuda"` with
+`HORNLAB_BEAT_FUSED_BM_CUDA=1` and no symmetry reduction. Every other CUDA
+shape is refused with the single-image rationale, and ROCm and Metal have no
+near-pair kernel at all -- see
+[the local patch](#the-one-local-patch-to-the-vendored-engine). Off is
+byte-for-byte the uncorrected request and result.
 
 Not supported: multi-source drive -- exactly one velocity source tag at unit
 amplitude -- WG's y-only `xz` half domain, per the symmetry note above, a
@@ -381,22 +390,40 @@ two of them uncorrected and say nothing about it. The patch makes
 exactly as before. **When that lands upstream, drop the patch and re-sync
 normally; until then a re-sync must re-apply it.**
 
-**The patch is applied to the CPU assembly only.** Upstream's CUDA paths take
-the same single-cache argument and have the same gap, but no machine available
-to this project has an NVIDIA GPU, so a CUDA edit here could not be executed,
-let alone verified -- and the correction is exactly the kind of change whose
-error is a plausible wrong number rather than a crash.
+**The multi-cache patch is applied to the CPU assembly only.** Upstream's CUDA
+paths take the same single-cache argument and have the same gap, but no machine
+available to this project has an NVIDIA GPU, so a CUDA edit here could not be
+executed, let alone verified -- and the correction is exactly the kind of
+change whose error is a plausible wrong number rather than a crash.
 
-**No accelerator backend has the correction at all.** ROCm has no near-pair
+**CUDA is available on one staged path: the fused assembler with no
+symmetry.** `near_correction=True` on `cuda` is accepted only when
+`HORNLAB_BEAT_FUSED_BM_CUDA=1` and the solve has no symmetry reduction --
+`native_symmetry_plane=None` and no enabled ground plane. That shape has no
+image transforms, so the direct assembler applies the one identity near cache
+it already accepts and the mixed-image hazard below cannot arise. When it
+runs, `diagnostics` carries `near_correction_applied`,
+`near_correction_cutoff`, `near_correction_order`,
+`near_correction_pair_count` and `assembly_path = "fused_cuda"`; with the flag
+off none of those keys are added, so the default CUDA result is unchanged.
+**Symmetry on this path is stage 2 and is still refused**, as is near
+correction on the four-operator CUDA path. The physical fused-CUDA-versus-CPU
+near-correction comparison on a real thin-septum mesh is the GPU lane's job;
+this repository's CUDA end-to-end testset is written and skipped on a host
+without a device.
+
+**None of the other accelerators has the correction.** ROCm has no near-pair
 kernel; neither does Metal, whose assembly entry point takes no
 near-correction cache and whose branch in `BeatEngineCore` forwards none.
 Until 2026-09-05 `near_correction=True` was accepted on `metal` and did
 nothing: an A/B at 2 kHz on a 320-face sphere put the flag's whole effect at
 1.8e-7 relative -- that backend's own run-to-run atomics noise -- against
 1.4e-4 on the CPU backend, while the Metal run's status line still announced a
-near-singular correction over 25,740 self-domain pairs. `SolveConfig` now
-refuses the flag on `cuda`, `rocm` and `metal`, and the capability report
-reads the same table. `near_correction` is therefore a **CPU-backend option**.
+near-singular correction over 25,740 self-domain pairs. `SolveConfig` refuses
+the flag on `rocm` and `metal`, keeps the refusal on `cuda` for every
+configuration outside the staged case above, and the capability report reads
+the same table. `near_correction` is therefore a **CPU option plus that one
+staged fused-CUDA case**.
 Implementing it on Metal is engine work: it belongs upstream in `boundary-lab`
 and arrives here through a re-sync, not through a patch to a vendored file.
 
@@ -881,7 +908,7 @@ All are environment variables; the defaults are the shipped configuration.
 | `BLAB_BEAT_GMRES_TOL` | `1e-5` | tolerance on the true relative residual. Exterior solves only; the coupled FEM/LEM path factorizes directly. See `VENDORING.md` |
 | `BLAB_BEAT_GMRES_BUDGET` | `1.0` | matvec budget for a *model-chosen* GMRES, in units of one LU; exceeding it falls back. An explicitly requested GMRES is not budgeted |
 | `BLAB_BEAT_FUSED_BM` | `1` | `0` restores the four-operator exterior path |
-| `HORNLAB_BEAT_FUSED_BM_CUDA` | — | `1` routes CUDA Burton-Miller assembly through the single-matrix fused assembler; required by `SolveConfig.source_profile_alpha` |
+| `HORNLAB_BEAT_FUSED_BM_CUDA` | — | `1` routes CUDA Burton-Miller assembly through the single-matrix fused assembler; required by `SolveConfig.source_profile_alpha` and by the staged CUDA `near_correction` case |
 | `BLAB_BEAT_CPU_REGULAR_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores the regular-pair arithmetic |
 | `BLAB_BEAT_CPU_SINGULAR_KERNEL` | `simd` | CPU source-request driver, fused Burton-Miller only; `scalar` restores the Duffy loop |
 | `BLAB_BEAT_CPU_FIELD_KERNEL` | `simd` | CPU source-request driver only; `scalar` restores field evaluation |

@@ -693,6 +693,19 @@ unchanged through the 2026-10-01 re-sync, also differ from the sync commit:
   handling; every other path refuses a non-zero value, and the result's
   diagnostics carry `source_profile_path = "fused_cuda"`. Zero (the default)
   reproduces the uniform source vector bit-for-bit.
+- **WP17 near-singular correction on the fused CUDA path**: `near_correction`
+  is allowed on `cuda` only when `HORNLAB_BEAT_FUSED_BM_CUDA=1` and the solve
+  has no symmetry reduction (`native_symmetry_plane=None`, no enabled ground
+  plane). The direct CUDA assembler already accepted
+  `near_correction_cache`/`device_near_correction_cache`; this change is the
+  gate (a staged exception in Python `config.py` plus the two-gate driver
+  check), passing the identity cache into the fused call, and the result proof
+  (`near_correction_applied`, `near_correction_cutoff`,
+  `near_correction_order`, `near_correction_pair_count`,
+  `assembly_path = "fused_cuda"`). None of those keys is added when the flag is
+  off. Symmetry on this path remains stage 2 and refused, and the physical
+  fused-CUDA-versus-CPU near comparison is deferred to the GPU lane; the CUDA
+  end-to-end testset is skipped on a host without a device.
 
 ### `hornlab_beat_bem/julia_cuda/{Project,Manifest}.toml`
 

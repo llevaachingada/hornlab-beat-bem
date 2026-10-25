@@ -963,6 +963,123 @@ function source_profile_diagnostics(alpha::Real, face_count::Integer, assembly_k
     )
 end
 
+"""
+    fused_cuda_near_correction_permitted(backend, near_requested, symmetry_mode, fused_env) -> Bool
+
+WP17 stage 1: whether the fused CUDA Burton-Miller assembler may carry a
+near-singular correction. Pure so the truth table is testable on a CPU with no
+device and no solve.
+
+All four have to hold: the backend is CUDA, the request asked for the
+correction, the fused assembler was requested through the same environment
+variable WP16 uses, and there is **no** symmetry reduction at all. The last one
+is the point of the stage. The CUDA device path carries a single image-near
+cache, so under `yz+xz` two of the three mirror transforms would integrate a
+near-singular kernel with the plain regular rule and say nothing about it --
+the silent-wrong hazard the Python refusal table documents. With no image
+transform there is nothing left uncorrected, so the single cache is enough.
+"""
+function fused_cuda_near_correction_permitted(
+    backend::Symbol,
+    near_requested::Bool,
+    symmetry_mode::Symbol,
+    fused_env::Bool,
+)
+    backend === :cuda || return false
+    near_requested || return false
+    fused_env || return false
+    return symmetry_mode === :off
+end
+
+"""
+    fused_cuda_burton_miller_selected(backend, near_requested, symmetry_mode, fused_env) -> Bool
+
+Whether the request takes the fused CUDA assembler. Off the CUDA backend, or
+without the opt-in variable, it never does. On CUDA the ground image is
+excluded as before, and a near-correction request is allowed to keep the
+fusion only under :func:`fused_cuda_near_correction_permitted`; every other
+near-correction request on CUDA is refused by
+:func:`require_near_correction_path` before this point rather than silently
+falling back to the four-operator path.
+"""
+function fused_cuda_burton_miller_selected(
+    backend::Symbol,
+    near_requested::Bool,
+    symmetry_mode::Symbol,
+    fused_env::Bool,
+)
+    backend === :cuda || return false
+    fused_env || return false
+    symmetry_mode === :ground && return false
+    near_requested &&
+        return fused_cuda_near_correction_permitted(
+            backend, near_requested, symmetry_mode, fused_env,
+        )
+    return true
+end
+
+"""
+    require_near_correction_path(backend, near_requested, symmetry_mode, fused_env)
+
+The loud half of the WP17 gate. A CUDA near-correction request outside the one
+staged case is an error before any assembly, never a fallback: the
+four-operator CUDA path builds near caches but this package has not validated
+that path, and a symmetric fused solve would leave image pairs uncorrected.
+
+The message quotes the standing rationale rather than summarising it, because
+that sentence -- not "unsupported" -- is what makes the refusal reviewable.
+"""
+function require_near_correction_path(
+    backend::Symbol,
+    near_requested::Bool,
+    symmetry_mode::Symbol,
+    fused_env::Bool,
+)
+    near_requested || return nothing
+    backend === :cuda || return nothing
+    fused_cuda_near_correction_permitted(
+        backend, near_requested, symmetry_mode, fused_env,
+    ) && return nothing
+    error(
+        "near_correction on the CUDA backend is available only on the fused " *
+        "CUDA Burton-Miller path with no symmetry reduction " *
+        "(HORNLAB_BEAT_FUSED_BM_CUDA=1, symmetry off, no ground plane): the " *
+        "CUDA device path carries a single image-near cache, so under a " *
+        "multi-image symmetry two of three mirror transforms would integrate " *
+        "a near-singular kernel with the plain regular rule and say nothing " *
+        "about it; refused rather than silently wrong. Symmetry on this path " *
+        "is WP17 stage 2 and remains refused.",
+    )
+end
+
+"""
+    near_correction_diagnostics(cutoff, order, pair_count, assembly_kind) -> Dict
+
+The diagnostics that PROVE a near-singular correction ran on the fused CUDA
+path. Empty for every other assembly, so the default result and the existing
+CPU near-correction result carry exactly the keys they did before.
+
+`near_correction_applied` is true only when at least one pair was corrected.
+A request whose mesh produced no near pairs keeps `near_correction_pair_count
+= 0` and says so; claiming a correction over zero pairs would be the same
+accepted-but-not-applied defect the refusal table exists for.
+"""
+function near_correction_diagnostics(
+    cutoff::Real,
+    order::Integer,
+    pair_count::Integer,
+    assembly_kind::Symbol,
+)
+    assembly_kind === :fused_cuda || return Dict{String,Any}()
+    return Dict{String,Any}(
+        "near_correction_applied" => pair_count > 0,
+        "near_correction_cutoff" => Float64(cutoff),
+        "near_correction_order" => Int(order),
+        "near_correction_pair_count" => Int(pair_count),
+        "assembly_path" => "fused_cuda",
+    )
+end
+
 #: Smallest P1 dof count at which overlapping the sweep pays by default.
 #:
 #: The overlap buys the CPU solve it hides behind the next frequency's GPU
@@ -1310,6 +1427,20 @@ function solve_request_impl(request)
         )
     end
 
+    # WP17: opt-in and absent by default. The staged rule is the fused CUDA
+    # assembler with no symmetry reduction, and this first gate refuses every
+    # other CUDA combination before the mesh loads. The second gate below sees
+    # the path the solve actually takes, which is the decision that matters.
+    near_correction_enabled = Bool(get_value(config, "near_correction_enabled", false))
+    if near_correction_enabled
+        require_near_correction_path(
+            beat_backend,
+            near_correction_enabled,
+            Symbol(symmetry_mode),
+            get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1",
+        )
+    end
+
     # BEAT assembles and solves in Float32 because that is what its CUDA and
     # ROCm kernels are written for. The CPU path is generic in the element
     # type, so it can run the same solve in Float64 -- which is what makes it
@@ -1401,16 +1532,33 @@ function solve_request_impl(request)
             BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather))
     # Opt-in route through the single-matrix CUDA Burton-Miller assembler
     # (~2A-NA-N storage instead of four operators). Off by default so the
-    # default CUDA path is byte-for-byte today's. The ground-plane image
-    # path has no coverage here yet and near-correction lives on the
-    # four-operator path, so both keep the old assembly.
-    fused_burton_miller_cuda = beat_backend == :cuda &&
-        near_selection === nothing &&
-        get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1" &&
-        Symbol(symmetry_mode) != :ground
-    # The early gate above could not see near-correction (it needs the mesh);
-    # this one sees the decision the solve will actually take.
+    # default CUDA path is byte-for-byte today's. The ground-plane image path
+    # has no coverage here and stays on the four-operator assembly.
+    #
+    # WP17 changed one clause: a near-correction request used to force the
+    # four-operator path unconditionally. It now keeps the fusion when there is
+    # no symmetry reduction, because the direct assembler takes the identity
+    # near cache itself. The decision is a named function so the truth table is
+    # testable without a device.
+    fused_burton_miller_cuda = fused_cuda_burton_miller_selected(
+        beat_backend,
+        near_correction_enabled,
+        Symbol(symmetry_mode),
+        get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", "0") == "1",
+    )
+    # WP16's early gate could not see the fusion decision; this one does. WP17's
+    # near-correction gate has the same two-stage shape: parse-time, then the
+    # path the solve will actually take.
     require_source_profile_path(source_profile_alpha, fused_burton_miller_cuda)
+    if near_correction_enabled && beat_backend == :cuda && !fused_burton_miller_cuda
+        # Unreachable through the two helpers above by construction; kept as the
+        # path-level assertion that the accepted request is the path that ran.
+        error(
+            "near_correction was accepted for the fused CUDA path but the " *
+            "solve selected a different path; refusing rather than running a " *
+            "correction the assembler would not apply",
+        )
+    end
     source_profile_face_count = 0
     near_correction_cache = nothing
     image_near_correction_caches = nothing
@@ -1690,6 +1838,11 @@ function solve_request_impl(request)
                     singular_cache=singular_cache,
                     device_singular_cache=device_singular_cache,
                     device_image_singular_cache=device_image_singular_cache,
+                    # WP17: identity pairs only. The staged rule has no image
+                    # transform, so there is no image-near cache to pass; the
+                    # image variants stay `nothing` on purpose.
+                    near_correction_cache=near_correction_cache,
+                    device_near_correction_cache=device_near_correction_cache,
                     symmetry_mode=Symbol(symmetry_mode),
                 )
                 assembly_payload = (kind=:fused_cuda, system=cuda_system, q_columns=fused_q_columns, d_q=d_q)
@@ -1948,6 +2101,20 @@ function solve_request_impl(request)
         )
         if assembly_payload.kind === :fused_cuda
             diagnostics["assembly_path"] = "fused_cuda"
+        end
+        if near_correction_enabled && assembly_payload.kind === :fused_cuda
+            # WP17: prove the correction ran on the path that claims it. Empty
+            # for every other assembly, so the default result and the existing
+            # CPU near-correction result add no keys.
+            merge!(
+                diagnostics,
+                near_correction_diagnostics(
+                    Float64(get_value(config, "near_correction_cutoff", 2.0)),
+                    Int(get_value(config, "near_correction_order", 8)),
+                    Int(assembly_payload.system.near_pair_count),
+                    assembly_payload.kind,
+                ),
+            )
         end
         if source_profile_requested
             # Empty when alpha is zero, so the default result keeps exactly the

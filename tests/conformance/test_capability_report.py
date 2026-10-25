@@ -236,8 +236,12 @@ def test_the_reported_symmetry_modes_match_the_mapping_the_solver_is_given():
     assert set(symmetry["refused"]) == {"xz", "xy"}
 
 
-def test_near_correction_is_reported_on_the_cpu_backend_only():
+def test_near_correction_is_reported_on_the_cpu_backend_only(monkeypatch):
     """Every accelerator refuses it, and Metal is the one that used to lie.
+
+    WP17's staged CUDA allowance keys on ``HORNLAB_BEAT_FUSED_BM_CUDA``; this
+    test is about the report's default contract, so the environment is pinned
+    to "unset" rather than inherited.
 
     Metal was reported supported and accepted by ``SolveConfig`` while the
     correction never ran: ``BeatEngineCore``'s ``:metal`` branch forwards no
@@ -250,6 +254,7 @@ def test_near_correction_is_reported_on_the_cpu_backend_only():
     table a decision rather than an edit.
     """
 
+    monkeypatch.delenv("HORNLAB_BEAT_FUSED_BM_CUDA", raising=False)
     supported = {
         backend: backend_capabilities(backend)["modes"]["exterior"]["quadrature"][
             "near_pair"

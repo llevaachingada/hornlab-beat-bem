@@ -30,10 +30,12 @@ from .config import (
     SolveConfig,
     beat_image_mode,
     beat_symmetry_mode,
+    fused_cuda_near_correction_allowed,
     ground_plane_enabled,
     reject_unrepresentable_observation_origin,
     reject_unsupported_ground_plane,
     reject_unsupported_native_symmetry,
+    reject_unsupported_near_correction,
 )
 from .mesh import read_gmsh22_info
 from .result import MeshInfo, SolveResult
@@ -88,6 +90,7 @@ __all__ = [
     "capability_report",
     "detach_workers",
     "discover_julia",
+    "fused_cuda_near_correction_allowed",
     "ground_plane_enabled",
     "generated_frequency_grid",
     "package_version",
@@ -96,6 +99,7 @@ __all__ = [
     "reject_unrepresentable_observation_origin",
     "reject_unsupported_ground_plane",
     "reject_unsupported_native_symmetry",
+    "reject_unsupported_near_correction",
     "shutdown_workers",
     "solve",
     "solve_frequencies",

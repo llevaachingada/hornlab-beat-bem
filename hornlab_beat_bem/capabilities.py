@@ -74,6 +74,12 @@ _BACKEND_PROJECTS = {
 #: Read, not restated: ``SolveConfig`` refuses exactly these backends with
 #: exactly these reasons, so the report cannot promise a correction the solve
 #: does not run. That drift is the defect this whole module is against.
+#:
+#: The one nuance WP17 adds is named in the CUDA entry's own reason text: the
+#: fused CUDA path with no symmetry reduction and the environment opt-in is
+#: allowed. The report still says ``supported: False`` there because it
+#: describes the default contract, and a boolean cannot carry "conditional on
+#: an environment variable and the solve shape" without promising it broadly.
 _NEAR_CORRECTION_REFUSALS = NEAR_CORRECTION_REFUSALS
 
 

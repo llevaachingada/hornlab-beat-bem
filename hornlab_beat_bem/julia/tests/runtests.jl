@@ -1741,3 +1741,233 @@ end
         @test !isapprox(profiled_pressure, uniform_pressure; rtol=0, atol=1e-9)
     end
 end
+
+
+@testset "WP17 near-correction gate" begin
+    # The whole truth table, on a CPU with no CUDA device: backend x request x
+    # symmetry x environment. The gate is a pure function precisely so this
+    # runs everywhere; the CUDA driver test further down is the device leg.
+    for backend in (:cpu, :cuda, :metal, :rocm)
+        for near in (false, true), symmetry in (:off, :x, :xy, :ground), env in (false, true)
+            permitted = fused_cuda_near_correction_permitted(backend, near, symmetry, env)
+            @test permitted == (backend === :cuda && near && env && symmetry === :off)
+
+            selected = fused_cuda_burton_miller_selected(backend, near, symmetry, env)
+            expected = backend === :cuda && env && symmetry !== :ground &&
+                       (!near || (env && symmetry === :off))
+            @test selected == expected
+        end
+    end
+
+    # Only the staged case passes the loud gate. Everything else on CUDA is an
+    # error, not a fallback, and the message carries the standing rationale.
+    @test require_near_correction_path(:cuda, true, :off, true) === nothing
+    @test require_near_correction_path(:cuda, false, :xy, false) === nothing
+    @test require_near_correction_path(:cpu, true, :xy, false) === nothing
+    for (symmetry, env) in ((:x, true), (:xy, true), (:ground, true), (:off, false))
+        refusal = try
+            require_near_correction_path(:cuda, true, symmetry, env)
+            nothing
+        catch err
+            err
+        end
+        @test refusal isa ErrorException
+        @test occursin("single image-near cache", refusal.msg)
+        @test occursin("silently wrong", refusal.msg)
+        @test occursin("stage 2", refusal.msg)
+    end
+
+    # Diagnostics exist only where the correction can have run, and claim
+    # "applied" only when at least one pair was actually corrected.
+    @test isempty(near_correction_diagnostics(2.0, 8, 12, :operators))
+    @test isempty(near_correction_diagnostics(2.0, 8, 12, :fused))
+    proof = near_correction_diagnostics(1.5, 6, 12, :fused_cuda)
+    @test proof["near_correction_applied"] === true
+    @test proof["near_correction_cutoff"] == 1.5
+    @test proof["near_correction_order"] == 6
+    @test proof["near_correction_pair_count"] == 12
+    @test proof["assembly_path"] == "fused_cuda"
+    @test near_correction_diagnostics(2.0, 8, 0, :fused_cuda)["near_correction_applied"] === false
+end
+
+@testset "WP17 thin-septum CPU near correction" begin
+    # Two parallel plates 4 mm apart with 30 mm elements: every cross-plate
+    # pair is disjoint, so no Duffy rule covers it and the 6-point regular rule
+    # cannot resolve the 1/r peak. That is the physical case the correction is
+    # for, and it reuses the fixture shape of the older close-pair testset
+    # above at a size where the pair selection has work to do.
+    T = Float32
+    plate_width = T(0.06)
+    thickness = T(0.004)
+    vertices = SVector{3,T}[]
+    for z in (T(0), thickness), row in 0:2, column in 0:2
+        push!(
+            vertices,
+            SVector{3,T}(T(column) * plate_width / 2, T(row) * plate_width / 2, z),
+        )
+    end
+    vertex_index(plate, column, row) = plate * 9 + row * 3 + column + 1
+    faces = NTuple{3,Int}[]
+    for plate in 0:1, row in 0:1, column in 0:1
+        a = vertex_index(plate, column, row)
+        b = vertex_index(plate, column + 1, row)
+        c = vertex_index(plate, column + 1, row + 1)
+        d = vertex_index(plate, column, row + 1)
+        if plate == 0
+            # Bottom plate faces outward along -z.
+            push!(faces, (a, d, b))
+            push!(faces, (b, d, c))
+        else
+            # Top plate faces outward along +z.
+            push!(faces, (a, b, d))
+            push!(faces, (b, c, d))
+        end
+    end
+    mesh = BoundaryMesh(vertices, faces, fill(1, length(faces)))
+    p1 = build_p1_space(mesh)
+    dp0 = build_dp0_space(mesh)
+    rule = triangle_rule(T, 2)
+    singular_cache = build_singular_correction_cache(mesh, 2)
+    k = T(2pi * 1000.0 / 343.0)
+
+    # The default request selects nothing: off is byte-for-byte the plain path.
+    @test near_correction_selection(
+        Dict{String,Any}("near_correction_enabled" => false), mesh, :off,
+    ) === nothing
+
+    config = Dict{String,Any}(
+        "near_correction_enabled" => true,
+        "near_correction_cutoff" => 2.0,
+        "near_correction_order" => 8,
+    )
+    selection = near_correction_selection(config, mesh, :off)
+    @test selection !== nothing
+    @test length(selection.identity_pairs) > 0
+    # The selection is the near-pair rule, so it also finds disjoint same-plate
+    # pairs at this cutoff. What the septum fixture has to prove is that the
+    # across-the-gap pairs -- the ones no Duffy rule covers -- are selected.
+    cross_plate_pairs = count(selection.identity_pairs) do pair
+        test_index, trial_index, _ = pair
+        (Float64(mesh.centroids[test_index][3]) < 0.002) !=
+            (Float64(mesh.centroids[trial_index][3]) < 0.002)
+    end
+    @test cross_plate_pairs > 0
+
+    # Selection then the established cache/assembly API: this is the same
+    # near_correction behavior the older testsets exercise, with the driver's
+    # pair chooser feeding it rather than a hand-written pair list.
+    near_cache = build_near_correction_cache(
+        mesh, selection.identity_pairs, selection.top_order,
+    )
+    assemble(cache) = assemble_regular_galerkin_operators(
+        mesh, p1, dp0, k, rule;
+        backend=:cpu, skip_singular=false, singular_cache=singular_cache,
+        near_correction_cache=cache,
+    )
+    base = assemble_regular_galerkin_operators(
+        mesh, p1, dp0, k, rule;
+        backend=:cpu, skip_singular=false, singular_cache=singular_cache,
+    )
+    corrected = assemble(near_cache)
+    reference = assemble(build_near_correction_cache(
+        mesh, selection.identity_pairs, selection.top_order,
+    ))
+
+    @test corrected.near_pair_count == near_cache.pair_count > 0
+    @test corrected.near_pair_quadrature_order == selection.top_order
+    @test corrected.single_layer == reference.single_layer
+    @test corrected.double_layer == reference.double_layer
+    @test corrected.hypersingular == reference.hypersingular
+
+    # The correction must move the operator measurably, not at rounding level.
+    single_scale = max(norm(base.single_layer), eps(T))
+    @test norm(corrected.single_layer - base.single_layer) / single_scale > T(1e-8)
+    @test all(isfinite, real.(corrected.single_layer))
+    @test all(isfinite, imag.(corrected.single_layer))
+end
+
+@testset "cuda fused WP17 near-correction driver path" begin
+    if !cuda_available()
+        @test_skip "CUDA unavailable; skipping CUDA-only BEAT Engine tests."
+    else
+        function near_correction_driver_result(near::Bool)
+            request = Dict{String,Any}(
+                "schema_version" => 2,
+                "beat_engine_backend" => "cuda",
+                "frequencies_hz" => [2000.0],
+                "config" => Dict{String,Any}(
+                    "mesh_file" => joinpath(@__DIR__, "..", "test_meshes", "sample.msh"),
+                    "scale_factor" => 0.001,
+                    "distance" => 2.0,
+                    "axial_offset" => 0.0,
+                    "step_size" => 5.0,
+                    "min_angle" => 0.0,
+                    "max_angle" => 180.0,
+                    "freq_min" => 2000.0,
+                    "freq_max" => 2000.0,
+                    "freq_count" => 1,
+                    "tag_throat" => 2,
+                    "rho" => 1.2041,
+                    "sound_speed" => 343.0,
+                    "symmetry" => "off",
+                    "source_motion" => "normal",
+                    "quadrature_order" => 2,
+                    "singular_order" => 2,
+                    "surface_traces_enabled" => true,
+                    "near_correction_enabled" => near,
+                    "near_correction_cutoff" => 1.0,
+                    "near_correction_order" => 8,
+                ),
+            )
+            previous = get(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA", nothing)
+            try
+                ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = "1"
+                return mktempdir() do directory
+                    event_path = joinpath(directory, "events.jsonl")
+                    open(event_path, "w") do io
+                        redirect_stdout(io) do
+                            solve_request(request)
+                        end
+                    end
+                    events = [JSON.parse(line) for line in eachline(event_path) if startswith(strip(line), "{")]
+                    results = [event for event in events if get(event, "type", "") == "result"]
+                    length(results) == 1 ||
+                        error("Expected exactly one result event, got $(length(results)).")
+                    results[1]["result"]
+                end
+            finally
+                if previous === nothing
+                    delete!(ENV, "HORNLAB_BEAT_FUSED_BM_CUDA")
+                else
+                    ENV["HORNLAB_BEAT_FUSED_BM_CUDA"] = previous
+                end
+            end
+        end
+
+        plain = near_correction_driver_result(false)
+        corrected = near_correction_driver_result(true)
+
+        # Off is the old CUDA result exactly: no near keys at all.
+        @test !haskey(plain["diagnostics"], "near_correction_applied")
+        @test !haskey(plain["diagnostics"], "near_correction_pair_count")
+        # On is provable: the path, the echoed tuning, and a real pair count.
+        @test corrected["diagnostics"]["assembly_path"] == "fused_cuda"
+        @test corrected["diagnostics"]["near_correction_cutoff"] == 1.0
+        @test corrected["diagnostics"]["near_correction_order"] == 8
+        @test corrected["diagnostics"]["near_correction_pair_count"] > 0
+        @test corrected["diagnostics"]["near_correction_applied"] == true
+        @test all(isfinite, Float32.(corrected["horizontal_spl_db"]))
+        @test all(isfinite, Float32.(corrected["vertical_spl_db"]))
+
+        plain_pressure = ComplexF32.(
+            plain["surface_pressure"]["real"], plain["surface_pressure"]["imag"],
+        )
+        corrected_pressure = ComplexF32.(
+            corrected["surface_pressure"]["real"], corrected["surface_pressure"]["imag"],
+        )
+        @test !isapprox(corrected_pressure, plain_pressure; rtol=0, atol=1e-9)
+
+        # The physical near-vs-CPU comparison is the GPU lane's job; this test
+        # only proves the request reached the fused assembler and reported it.
+    end
+end

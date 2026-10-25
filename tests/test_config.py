@@ -1,10 +1,13 @@
 import pytest
 
 from hornlab_beat_bem import (
+    GroundPlane,
     ObservationConfig,
     SolveConfig,
     beat_symmetry_mode,
+    fused_cuda_near_correction_allowed,
     reject_unsupported_native_symmetry,
+    reject_unsupported_near_correction,
 )
 from hornlab_beat_bem.sweep import _request_payload
 
@@ -183,6 +186,71 @@ def test_near_correction_validation():
     # Off, it is not a refusal on any backend: the flag is what is refused.
     for backend in ("cpu", "cuda", "rocm", "metal"):
         SolveConfig(near_correction=False, beat_backend=backend)
+
+
+def test_near_correction_is_allowed_on_the_fused_cuda_path_without_symmetry(monkeypatch):
+    """WP17 stage 1: the one CUDA combination with no image pairs."""
+
+    monkeypatch.setenv("HORNLAB_BEAT_FUSED_BM_CUDA", "1")
+    config = SolveConfig(near_correction=True, beat_backend="cuda")
+    assert fused_cuda_near_correction_allowed(config) is True
+    solver_config = _request_payload_config(config)
+    assert solver_config["near_correction_enabled"] is True
+    assert solver_config["near_correction_cutoff"] == pytest.approx(2.0)
+    assert solver_config["near_correction_order"] == 8
+
+    # The predicate is about the staged combination, not about CUDA alone.
+    assert fused_cuda_near_correction_allowed(SolveConfig()) is False
+    assert fused_cuda_near_correction_allowed(
+        SolveConfig(near_correction=True, beat_backend="cpu")
+    ) is False
+
+
+def test_near_correction_on_cuda_without_the_fused_path_is_still_refused(monkeypatch):
+    monkeypatch.delenv("HORNLAB_BEAT_FUSED_BM_CUDA", raising=False)
+    with pytest.raises(NotImplementedError, match="CUDA") as caught:
+        SolveConfig(near_correction=True, beat_backend="cuda")
+    message = str(caught.value)
+    assert "single image-near cache" in message
+    assert "HORNLAB_BEAT_FUSED_BM_CUDA=1" in message
+
+
+def test_near_correction_on_fused_cuda_with_native_symmetry_is_refused(monkeypatch):
+    """The exact silent-wrong hazard the standing refusal documents."""
+
+    monkeypatch.setenv("HORNLAB_BEAT_FUSED_BM_CUDA", "1")
+    for plane in ("yz", "yz+xz"):
+        with pytest.raises(NotImplementedError, match="stage 2") as caught:
+            SolveConfig(
+                near_correction=True,
+                beat_backend="cuda",
+                native_symmetry_plane=plane,
+            )
+        message = str(caught.value)
+        assert "single image-near cache" in message
+        assert "multi-image symmetry" in message
+
+
+def test_near_correction_on_fused_cuda_with_a_ground_plane_is_refused(monkeypatch):
+    monkeypatch.setenv("HORNLAB_BEAT_FUSED_BM_CUDA", "1")
+    with pytest.raises(NotImplementedError, match="ground plane") as caught:
+        SolveConfig(
+            near_correction=True,
+            beat_backend="cuda",
+            ground_plane=GroundPlane(enabled=True, axis="y"),
+        )
+    assert "single image-near cache" in str(caught.value)
+
+
+def test_near_correction_refusal_is_rechecked_before_a_solve(monkeypatch):
+    """A config mutated after construction cannot slip past the gate."""
+
+    monkeypatch.setenv("HORNLAB_BEAT_FUSED_BM_CUDA", "1")
+    config = SolveConfig(near_correction=True, beat_backend="cuda")
+    reject_unsupported_near_correction(config)
+    config.native_symmetry_plane = "yz"
+    with pytest.raises(NotImplementedError, match="stage 2"):
+        reject_unsupported_near_correction(config)
 
 
 def test_quadrature_order_is_restricted_to_the_orders_the_engine_has():
