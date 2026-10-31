@@ -5,7 +5,15 @@
 # covers the four properties C4 asks for: superposition, reciprocity,
 # single-tag parity with the legacy impedance, and reduced-vs-full symmetry.
 
-wire_rows(block) = ComplexF32.(block["real"], block["imag"])
+# The wire format nests one block per channel, and inside a block the pressure
+# array is itself nested (planes x angles). Flatten each channel to a vector so
+# the tests compare numbers, not shapes; the tolerances stay as written.
+_flatten(x::Number) = Float32[x]
+_flatten(x::AbstractArray) = reduce(vcat, (_flatten(v) for v in x); init = Float32[])
+wire_rows(block) = [
+    ComplexF32.(_flatten(re), _flatten(im)) for
+    (re, im) in zip(block["real"], block["imag"])
+]
 force_from_pair(pair) = ComplexF64(2.0 * pair[1]) - 2.0im * ComplexF64(pair[2])
 
 @testset "MEH radiator impedance matrix (helper algebra)" begin
@@ -170,8 +178,7 @@ end
                 "sound_speed" => 343.0,
                 "symmetry" => "off",
                 "source_motion" => "normal",
-                "quadrature_order" => 1,
-                "singular_order" => 1,
+
                 "flat_target_normalization_enabled" => false,
                 "impedance_matrix_enabled" => true,
                 "radiators" => radiators,
@@ -211,12 +218,12 @@ end
 
         # Superposition: the two channel rows sum to the single combined row,
         # both in the observed pressure and in the force matrix.
-        pair_h = wire_rows(pair["horizontal_pressure"])
-        combined_h = wire_rows(combined["horizontal_pressure"])
-        @test vec(sum(pair_h, dims=1)) ≈ vec(combined_h) rtol = 1.0f-5
-        pair_v = wire_rows(pair["vertical_pressure"])
-        combined_v = wire_rows(combined["vertical_pressure"])
-        @test vec(sum(pair_v, dims=1)) ≈ vec(combined_v) rtol = 1.0f-5
+        pair_h = reduce(+, wire_rows(pair["horizontal_pressure"]))
+        combined_h = reduce(+, wire_rows(combined["horizontal_pressure"]))
+        @test pair_h ≈ combined_h rtol = 1.0f-5
+        pair_v = reduce(+, wire_rows(pair["vertical_pressure"]))
+        combined_v = reduce(+, wire_rows(combined["vertical_pressure"]))
+        @test pair_v ≈ combined_v rtol = 1.0f-5
 
         pair_forces = [
             [force_from_pair(entry) for entry in row] for row in pair["impedance_matrix"]
@@ -229,7 +236,7 @@ end
         end
 
         # Reciprocity: F_ij == F_ji for equal-area patches on a rigid body.
-        scale = max(maximum(abs.(pair_forces)), eps(Float64))
+        scale = max(maximum(abs, reduce(vcat, pair_forces)), eps(Float64))
         @test abs(pair_forces[1][2] - pair_forces[2][1]) / scale < 1.0f-3
 
         # Single-tag parity: the matrix diagonal is the legacy impedance pair.
