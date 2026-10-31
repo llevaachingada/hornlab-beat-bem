@@ -345,12 +345,21 @@ class SolveConfig:
     freq_count: int = 40
     freq_spacing: Literal["log", "linear"] = "log"
 
-    # Boundary condition. Only the acceleration output convention and a single
-    # unit-amplitude source tag are supported; see class docs. "normal" drives
-    # a uniformly breathing cap; "axial" a rigid piston along the +z axis
-    # (per-face velocity scaled by n_hat . z), mirroring the other backends.
+    # Boundary condition. 1..8 unit-amplitude source tags; see class docs.
+    # "normal" drives a uniformly breathing cap; "axial" a rigid piston along
+    # the +z axis (per-face velocity scaled by n_hat . z), mirroring the other
+    # backends. With one tag the request payload and every output are
+    # byte-identical to the single-source package; with two or more the request
+    # carries one ``radiators`` entry per tag, each on its own zero-padded
+    # channel.
     velocity_sources: dict[int, float] = field(default_factory=lambda: {2: 1.0})
     source_motion: str = "normal"
+
+    #: MEH opt-in: emit the full radiator-to-radiator force matrix alongside
+    #: the legacy single impedance. Off by default, so the request and result
+    #: keep exactly the keys they had. Requires nothing special at one tag;
+    #: its diagonal is that tag's own mean pressure (the legacy ``impedance``).
+    impedance_matrix: bool = False
 
     #: WP16 opt-in phase-plug-like exit profile, applied per source face as
     #: ``v(r) = 1 + alpha * J0(j01 * r / r0)`` and normalised so the tag's
@@ -517,35 +526,39 @@ class SolveConfig:
                     "worker inherits; every other path would assemble the "
                     "uniform drive and report a profile it never applied"
                 )
-        if not isinstance(self.velocity_sources, dict) or len(self.velocity_sources) != 1:
+        if not isinstance(self.velocity_sources, dict) or not (
+            1 <= len(self.velocity_sources) <= 8
+        ):
             raise NotImplementedError(
-                "hornlab-beat-bem supports exactly one velocity source tag"
+                "hornlab-beat-bem supports between one and eight velocity source tags"
             )
-        ((tag, amplitude),) = self.velocity_sources.items()
-        if not _is_integral_value(tag):
-            raise ValueError("velocity_sources tag must be an integer")
-        # A complex amplitude is refused as a *refusal*, not as a TypeError out
-        # of float(): the capability report declares complex drives refused and
-        # every other refusal here raises NotImplementedError, so a caller that
-        # catches the documented type must not be surprised by the built-in.
-        if isinstance(amplitude, complex) or getattr(amplitude, "imag", 0) != 0:
-            raise NotImplementedError(
-                "hornlab-beat-bem supports a real unit source amplitude only; "
-                f"the complex amplitude {amplitude!r} would carry a drive "
-                "phase this package's single synthesised source channel "
-                "cannot express"
-            )
-        try:
-            amplitude_value = float(amplitude)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(
-                "velocity_sources amplitude must be a real number, got "
-                f"{amplitude!r}"
-            ) from None
-        if amplitude_value != 1.0:
-            raise NotImplementedError(
-                "hornlab-beat-bem supports unit source amplitude only"
-            )
+        for tag, amplitude in self.velocity_sources.items():
+            if not _is_integral_value(tag):
+                raise ValueError("velocity_sources tag must be an integer")
+            # A complex amplitude is refused as a *refusal*, not as a TypeError
+            # out of float(): the capability report declares complex drives
+            # refused and every other refusal here raises NotImplementedError,
+            # so a caller that catches the documented type must not be
+            # surprised by the built-in.
+            if isinstance(amplitude, complex) or getattr(amplitude, "imag", 0) != 0:
+                raise NotImplementedError(
+                    "hornlab-beat-bem supports a real unit source amplitude only; "
+                    f"the complex amplitude {amplitude!r} would carry a drive "
+                    "phase this package's source channels cannot express"
+                )
+            try:
+                amplitude_value = float(amplitude)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    "velocity_sources amplitude must be a real number, got "
+                    f"{amplitude!r}"
+                ) from None
+            if amplitude_value != 1.0:
+                raise NotImplementedError(
+                    "hornlab-beat-bem supports unit source amplitude only"
+                )
+        if not isinstance(self.impedance_matrix, bool):
+            raise ValueError("impedance_matrix must be a bool")
         if self.native_symmetry_plane not in {None, "yz", "xz", "xy", "yz+xz"}:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
@@ -611,9 +624,16 @@ class SolveConfig:
         reject_unrepresentable_observation_origin(self)
 
     @property
+    def source_tags(self) -> tuple[int, ...]:
+        """Every driven tag, sorted; the order the request's radiators use."""
+
+        return tuple(sorted(int(tag) for tag in self.velocity_sources))
+
+    @property
     def source_tag(self) -> int:
-        ((tag, _),) = self.velocity_sources.items()
-        return int(tag)
+        """The smallest driven tag; the legacy single-source key."""
+
+        return self.source_tags[0]
 
 
 def reject_unrepresentable_observation_origin(config: SolveConfig) -> None:

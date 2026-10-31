@@ -76,6 +76,25 @@ class SolveResult:
     surface_pressure_complex: NDArray[np.complex128] | None = None
     surface_neumann_complex: NDArray[np.complex128] | None = None
 
+    # MEH multi-source fields. All ``None`` with one tag and no impedance
+    # matrix, which is exactly the single-source result this package has
+    # always returned. With two or more tags the legacy fields above are the
+    # channel of the smallest tag (the CD in the MEH contract).
+    #
+    #: Driven tags, sorted; matches ``channel_pressure``'s C axis.
+    channel_tags: tuple[int, ...] | None = None
+    #: (F, C, P, N) pressure per channel, per unit normal acceleration on that
+    #: channel's own tag.
+    channel_pressure: NDArray[np.complex128] | None = None
+    #: (F, C, n_theta*n_phi) when a sphere grid was requested, otherwise None.
+    channel_sphere_pressure: NDArray[np.complex128] | None = None
+    #: (F, C, C): ``[f, i, j]`` is the area-mean pressure on tag i per unit
+    #: normal acceleration on tag j, same packing and acceleration basis as
+    #: ``impedance``. Present only when ``SolveConfig.impedance_matrix`` is on.
+    impedance_matrix: NDArray[np.complex128] | None = None
+    #: Full-domain area per tag (reduced-mesh area times the symmetry factor).
+    tag_areas_m2: dict[int, float] | None = None
+
     #: True when the solver stopped early because cancellation was requested
     #: (``on_frequency_result`` returning ``False``, or a cancel written to
     #: the job directory). A cancelled sweep returns the frequencies it did

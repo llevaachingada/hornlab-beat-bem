@@ -176,6 +176,19 @@ def _request_payload(
     # WP16: opt-in, so the default request stays byte-for-byte the old one.
     if config.source_profile_alpha != 0.0:
         solver_config["source_profile_alpha"] = float(config.source_profile_alpha)
+    # MEH: two or more driven tags become one radiator per tag, each on its own
+    # zero-padded channel. Zero padding matters because the Julia driver sorts
+    # channel names lexicographically, and tag002 < tag010 is the tag order.
+    # With one tag this key is absent, so the default request is unchanged.
+    if len(config.source_tags) >= 2:
+        solver_config["radiators"] = [
+            {"name": f"tag{tag:03d}", "tag": tag, "channel": f"tag{tag:03d}"}
+            for tag in config.source_tags
+        ]
+    # Opt-in too: absent unless requested, so the default result keeps the keys
+    # it had. The engine omits its "impedance_matrix" reply when this is absent.
+    if config.impedance_matrix:
+        solver_config["impedance_matrix_enabled"] = True
     if ground_plane_enabled(config):
         # The half-space containment guard lives in the Julia driver, because
         # only it sees the mesh after loading, scaling and translation.
@@ -280,13 +293,26 @@ def solve_frequencies(
         )
 
     mesh_info = read_gmsh22_info(mesh_path, scale=config.mesh_scale)
-    source_area = mesh_info.physical_tag_areas_m2.get(config.source_tag, 0.0)
-    if source_area <= 0.0:
-        raise ValueError(
-            f"mesh {mesh_path} has no triangles with source tag {config.source_tag}"
-        )
+    source_tags = config.source_tags
+    tag_areas_reduced: dict[int, float] = {}
+    for tag in source_tags:
+        area = mesh_info.physical_tag_areas_m2.get(tag, 0.0)
+        if area <= 0.0:
+            raise ValueError(
+                f"mesh {mesh_path} has no triangles with source tag {tag}"
+            )
+        tag_areas_reduced[tag] = area
+    source_area = tag_areas_reduced[config.source_tag]
     symmetry_mode = beat_image_mode(config)
     symmetry_factor = _SYMMETRY_FACTOR[symmetry_mode]
+    tag_areas_m2 = {
+        tag: area * symmetry_factor for tag, area in tag_areas_reduced.items()
+    }
+    # One tag with no matrix is the old single-source contract, and the code
+    # below then allocates none of the MEH fields. The matrix is useful with a
+    # single tag too (its diagonal is the legacy impedance), so a requested
+    # matrix populates the channel arrays even at C == 1.
+    collect_channels = len(source_tags) >= 2 or config.impedance_matrix
 
     translation = _ground_placed_translation(
         _validated_frame_translation(config.frame_override), config
@@ -354,6 +380,34 @@ def solve_frequencies(
         pressure = np.full((total, len(planes), angles.size), np.nan, dtype=np.complex128)
         spl = np.full((total, len(planes), angles.size), np.nan, dtype=np.float64)
         impedance = np.full(total, np.nan, dtype=np.complex128)
+        channel_count = len(source_tags)
+        channel_pressure = (
+            np.full(
+                (total, channel_count, len(planes), angles.size),
+                np.nan,
+                dtype=np.complex128,
+            )
+            if collect_channels
+            else None
+        )
+        channel_sphere_pressure = (
+            np.full(
+                (total, channel_count, sphere_pressure.shape[1]),
+                np.nan,
+                dtype=np.complex128,
+            )
+            if collect_channels and sphere_pressure is not None
+            else None
+        )
+        impedance_matrix = (
+            np.full(
+                (total, channel_count, channel_count),
+                np.nan,
+                dtype=np.complex128,
+            )
+            if config.impedance_matrix
+            else None
+        )
         solved_frequencies = np.full(total, np.nan, dtype=np.float64)
         timings = {"assembly_s": 0.0, "solve_s": 0.0, "field_s": 0.0}
         solver_log: list[dict[str, Any]] = []
@@ -388,31 +442,54 @@ def solve_frequencies(
             acceleration_scale = 1.0 / (-1j * omega)
 
             channel_names = list(raw.get("channel_names") or ["main"])
-            if len(channel_names) != 1:
+            if len(source_tags) >= 2:
+                expected_channels = [f"tag{tag:03d}" for tag in source_tags]
+                if channel_names != expected_channels:
+                    raise RuntimeError(
+                        "BEAT solver returned channels "
+                        f"{channel_names} where {expected_channels} were requested; "
+                        "zero-padded channel names must come back sorted in tag "
+                        "order"
+                    )
+            elif len(channel_names) != 1:
                 raise RuntimeError(
                     "hornlab-beat-bem drives a single synthesized channel; the "
                     f"solver returned channels {channel_names}"
                 )
             rows_by_cut = {
-                "horizontal": _wire_rows(raw.get("horizontal_pressure"))[0],
-                "vertical": _wire_rows(raw.get("vertical_pressure"))[0],
+                "horizontal": _wire_rows(raw.get("horizontal_pressure")),
+                "vertical": _wire_rows(raw.get("vertical_pressure")),
             }
             if "diagonal" in planes:
-                rows_by_cut["diagonal"] = _wire_rows(raw.get("diagonal_pressure"))[0]
-            entry_pressure = np.stack(
-                [rows_by_cut[plane] * acceleration_scale for plane in planes]
+                rows_by_cut["diagonal"] = _wire_rows(raw.get("diagonal_pressure"))
+            for plane, rows in rows_by_cut.items():
+                if rows.shape[0] != channel_count:
+                    raise RuntimeError(
+                        f"BEAT solver {plane} block carries {rows.shape[0]} "
+                        f"channel rows where {channel_count} were requested"
+                    )
+            # (C, P, A): one row per channel, then rescaled to unit normal
+            # acceleration like the legacy single-channel field.
+            all_pressure = np.stack(
+                [rows_by_cut[plane] * acceleration_scale for plane in planes],
+                axis=1,
             )
-            if entry_pressure.shape[1] != angles.size:
+            if all_pressure.shape[2] != angles.size:
                 raise RuntimeError(
                     "BEAT solver angle grid does not match its pressure rows: "
-                    f"{entry_pressure.shape[1]} != {angles.size}"
+                    f"{all_pressure.shape[2]} != {angles.size}"
                 )
+            entry_pressure = all_pressure[0]
             with np.errstate(divide="ignore"):
                 entry_spl = 20.0 * np.log10(np.abs(entry_pressure) / 20e-6)
+            if channel_pressure is not None:
+                channel_pressure[index] = all_pressure
 
             impedance_pairs = raw.get("impedance") or []
             entry_impedance: complex | None = None
             if impedance_pairs:
+                # One impedance pair per radiator, and the request's radiators
+                # are in sorted tag order, so [0] is the smallest tag's channel.
                 pair = impedance_pairs[0]
                 if len(pair) == 2 and all(math.isfinite(float(value)) for value in pair):
                     # Undo the solver's [Re(F)/2, -Im(F)/2] packing and its x10
@@ -426,14 +503,64 @@ def solve_frequencies(
                     )
                     entry_impedance = complex(mean_pressure_velocity * acceleration_scale)
 
+            if impedance_matrix is not None:
+                matrix_pairs = raw.get("impedance_matrix")
+                if matrix_pairs is None:
+                    raise RuntimeError(
+                        "impedance_matrix was requested but the BEAT solver "
+                        "returned none"
+                    )
+                if len(matrix_pairs) != channel_count:
+                    raise RuntimeError(
+                        "BEAT solver impedance matrix has "
+                        f"{len(matrix_pairs)} channel rows where {channel_count} "
+                        "were requested"
+                    )
+                for j, row in enumerate(matrix_pairs):
+                    if len(row) != channel_count:
+                        raise RuntimeError(
+                            "BEAT solver impedance matrix row "
+                            f"{j} has {len(row)} entries where {channel_count} "
+                            "were requested"
+                        )
+                    for i, pair in enumerate(row):
+                        if len(pair) != 2 or not all(
+                            math.isfinite(float(value)) for value in pair
+                        ):
+                            raise RuntimeError(
+                                "BEAT solver impedance matrix entry "
+                                f"[{j}][{i}] is not a finite [Re, -Im] pair"
+                            )
+                        # [j][i] is channel j's boundary pressure on radiator i.
+                        # Same unpacking as the legacy impedance, but tag i's
+                        # reduced area, and stored as [f, i, j] so the matrix is
+                        # indexed (receiver tag, drive tag).
+                        force = 2.0 * float(pair[0]) - 2.0j * float(pair[1])
+                        mean_pressure_velocity = force / (
+                            _BEAT_IMPEDANCE_FORCE_FACTOR
+                            * symmetry_factor
+                            * tag_areas_reduced[source_tags[i]]
+                        )
+                        impedance_matrix[index, i, j] = complex(
+                            mean_pressure_velocity * acceleration_scale
+                        )
+
             if sphere_pressure is not None:
-                sphere_row = _wire_rows(raw.get("sphere_pressure"))[0]
-                if sphere_row.size != sphere_pressure.shape[1]:
+                sphere_rows = _wire_rows(raw.get("sphere_pressure"))
+                if sphere_rows.shape[0] != channel_count:
+                    raise RuntimeError(
+                        "BEAT solver sphere block carries "
+                        f"{sphere_rows.shape[0]} channel rows where "
+                        f"{channel_count} were requested"
+                    )
+                if sphere_rows.shape[1] != sphere_pressure.shape[1]:
                     raise RuntimeError(
                         "BEAT solver sphere pressure row does not match its grid: "
-                        f"{sphere_row.size} != {sphere_pressure.shape[1]}"
+                        f"{sphere_rows.shape[1]} != {sphere_pressure.shape[1]}"
                     )
-                sphere_pressure[index] = sphere_row * acceleration_scale
+                sphere_pressure[index] = sphere_rows[0] * acceleration_scale
+                if channel_sphere_pressure is not None:
+                    channel_sphere_pressure[index] = sphere_rows * acceleration_scale
 
             if config.surface_traces:
                 trace_pressure = _wire_vector(raw.get("surface_pressure"), "surface_pressure")
@@ -519,6 +646,18 @@ def solve_frequencies(
             sphere_phi_deg=sphere_phi_deg,
             surface_pressure_complex=None if surface_pressure is None else surface_pressure[:count],
             surface_neumann_complex=None if surface_neumann is None else surface_neumann[:count],
+            # MEH fields: all None for the one-tag, no-matrix default.
+            channel_tags=tuple(source_tags) if collect_channels else None,
+            channel_pressure=None if channel_pressure is None else channel_pressure[:count],
+            channel_sphere_pressure=(
+                None
+                if channel_sphere_pressure is None
+                else channel_sphere_pressure[:count]
+            ),
+            impedance_matrix=(
+                None if impedance_matrix is None else impedance_matrix[:count]
+            ),
+            tag_areas_m2=dict(tag_areas_m2) if collect_channels else None,
             cancelled=terminal_event == "cancelled",
             requested_frequency_count=total,
         )

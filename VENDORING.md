@@ -706,6 +706,14 @@ unchanged through the 2026-10-01 re-sync, also differ from the sync commit:
   off. Symmetry on this path remains stage 2 and refused, and the physical
   fused-CUDA-versus-CPU near comparison is deferred to the GPU lane; the CUDA
   end-to-end testset is skipped on a host without a device.
+- **MEH multi-source radiators** (task M2, branch
+  `hornlab-search/meh-multisource`): 1..8 unit-amplitude source tags; with two
+  or more the Python request sends one zero-padded `radiators` entry per tag
+  (own channel, no `channels` block) and the driver reports every channel's
+  pressure and, behind `impedance_matrix_enabled`, `impedance_matrix[j][i]` —
+  the full-domain force on radiator i from channel j's boundary pressure at
+  unit drive, using the existing `[Re(F)/2, -Im(F)/2]` x10 packing. With one
+  tag and no matrix the request and result keep exactly their previous keys.
 
 ### `hornlab_beat_bem/julia_cuda/{Project,Manifest}.toml`
 

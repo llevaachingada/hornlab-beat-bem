@@ -101,7 +101,6 @@ def test_the_second_refusal_spelling_is_collected_and_exercised():
         "observation.arbitrary_points",
         "observation.post_solve_field_replay",
         "quantities.acoustic_power",
-        "quantities.per_tag_mean_pressures",
         "mesh_input.multiple_bodies",
     } <= set(unsupported)
     assert set(unsupported) <= _declared_refusal_paths(metal)

@@ -87,9 +87,16 @@ def test_solve_config_rejects_non_unit_amplitude():
         SolveConfig(velocity_sources={2: 0.5})
 
 
-def test_solve_config_rejects_multiple_sources():
-    with pytest.raises(NotImplementedError):
-        SolveConfig(velocity_sources={2: 1.0, 3: 1.0})
+def test_solve_config_accepts_one_to_eight_sources():
+    config = SolveConfig(velocity_sources={2: 1.0, 10: 1.0})
+    assert config.source_tags == (2, 10)
+    # The legacy key is the smallest tag, so the CD stays the legacy channel.
+    assert config.source_tag == 2
+    assert SolveConfig(
+        velocity_sources={tag: 1.0 for tag in (2, 10, 11, 12, 13, 14, 15, 16)}
+    ).source_tags == (2, 10, 11, 12, 13, 14, 15, 16)
+    with pytest.raises(NotImplementedError, match="one and eight"):
+        SolveConfig(velocity_sources={tag: 1.0 for tag in range(2, 11)})
 
 
 def test_source_tag_reflects_velocity_sources():

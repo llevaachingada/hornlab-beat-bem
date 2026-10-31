@@ -13,8 +13,9 @@ Julia engine but has no path through the supported Python API is **not** a
 package capability. The engine can solve coupled FEM-BEM-LEM problems and this
 package cannot ask it to, so ``coupled_fem_bem_lem`` is reported unsupported
 with that as its reason rather than omitted or reported true. The same applies
-to multiple source channels, arbitrary observation points, and post-solve field
-replay.
+to arbitrary observation points and post-solve field replay; multiple source
+channels and the radiator impedance matrix are now reachable and are reported
+as supported.
 
 Versioning: :data:`CAPABILITY_SCHEMA_VERSION` moves when the *shape* changes.
 A capability flipping from false to true is a content change and does not move
@@ -47,7 +48,12 @@ from .config import (
 #: block. Both are shape changes, so the version moves; the Metal near-pair
 #: entry flipping to unsupported in the same commit is a content change and
 #: would not have moved it on its own.
-CAPABILITY_SCHEMA_VERSION = 2
+#:
+#: 3 (2026-10-31): ``sources.count.supported`` became the list of supported tag
+#: counts (1..8) rather than the integer 1, and
+#: ``quantities.per_tag_mean_pressures`` became a conditional capability keyed
+#: on ``impedance_matrix`` rather than ``supported: False``.
+CAPABILITY_SCHEMA_VERSION = 3
 
 #: Wire schema version of the request ``sweep._request_payload`` builds. Kept
 #: here so a capability consumer sees the request contract it is paired with.
@@ -241,10 +247,12 @@ def _ground_plane() -> dict[str, Any]:
 def _sources() -> dict[str, Any]:
     return {
         "count": {
-            "supported": 1,
+            "supported": list(range(1, 9)),
+            "supported_min": 1,
+            "supported_max": 8,
             "refused_note": (
-                "the engine has multiple source channels; the package request "
-                "compiler drives exactly one tag and one synthesised channel"
+                "more than eight source tags are refused; with two or more the "
+                "request carries one zero-padded channel per tag"
             ),
         },
         "amplitude": {
@@ -390,8 +398,13 @@ def _returned_quantities() -> dict[str, Any]:
             "reason": "no surface or sphere power integration is exposed",
         },
         "per_tag_mean_pressures": {
-            "supported": False,
-            "reason": "one source tag, so there is one mean pressure",
+            "supported": "impedance_matrix",
+            "field": "impedance_matrix",
+            "requires": "SolveConfig.impedance_matrix=True",
+            "diagonal": (
+                "impedance_matrix[f, i, i] is tag i's area-mean pressure per "
+                "unit normal acceleration on tag i"
+            ),
         },
     }
 

@@ -1336,6 +1336,39 @@ function impedance_for_radiators(mesh, element_mesh_ids, pressure, radiators, dr
     return impedance
 end
 
+# MEH (opt-in): row j = force on every radiator from channel j's own boundary
+# pressure at unit drive. `channel_boundary_pressures[j]` is built from
+# `channel_unit_drives` (velocity_offset 0 dB, no flat-target correction), so
+# it is already per unit velocity and is NOT divided by a drive here.
+#
+# The returned array is `matrix[j][i] = [Re(F)/2, -Im(F)/2]` with the same
+# force scale and x10 display packing as `impedance_for_radiators`: F is the
+# full-domain force on radiator i (reduced-mesh integral times the symmetry
+# factor) from channel j. Python unpacks it as `[f, i, j]`.
+function impedance_matrix_for_channels(mesh, element_mesh_ids, channel_boundary_pressures, radiators, ::Type{T};
+                                       symmetry_mode::Symbol=:off) where {T<:AbstractFloat}
+    matrix = Vector{Vector{Vector{Float32}}}()
+    for pressure in channel_boundary_pressures
+        force_scale = eltype(pressure)(symmetry_mode == :ground ? 1 : symmetry_reduction_factor(symmetry_mode))
+        row = Vector{Vector{Float32}}()
+        for radiator in radiators
+            total_force = zero(eltype(pressure))
+            tag = Int(radiator["tag"])
+            for element_index in eachindex(mesh.physical_tags)
+                mesh.physical_tags[element_index] == tag || continue
+                radiator_owns_element(radiator, element_mesh_ids, element_index) || continue
+                face = mesh.faces[element_index]
+                p_avg = (pressure[face[1]] + pressure[face[2]] + pressure[face[3]]) / eltype(pressure)(3.0)
+                total_force += p_avg * eltype(pressure)(mesh.areas[element_index]) * force_scale
+            end
+            total_force *= eltype(pressure)(10.0)
+            push!(row, [Float32(real(total_force) / 2), Float32(-imag(total_force) / 2)])
+        end
+        push!(matrix, row)
+    end
+    return matrix
+end
+
 function solve_request(request)
     try
         solve_request_impl(request)
@@ -2010,6 +2043,7 @@ function solve_request_impl(request)
         horizontal_norm = Float32[]
         vertical_norm = Float32[]
         impedance = Vector{Vector{Float32}}()
+        impedance_matrix = nothing
         sphere_norm = nothing
         synthesis = nothing
         drives = Complex{FloatType}[]
@@ -2039,7 +2073,21 @@ function solve_request_impl(request)
                 mixed_boundary_pressure .+= channel_boundary_pressures[channel_index] .* synthesis.weights[channel_index]
                 mixed_boundary_neumann .+= channel_boundary_neumann[channel_index] .* synthesis.weights[channel_index]
             end
-            impedance = impedance_for_radiators(mesh, element_mesh_ids, mixed_boundary_pressure, radiators, drives, FloatType; symmetry_mode=Symbol(symmetry_mode))
+            # C4: with several driven tags the legacy impedance is the smallest
+            # tag's channel, not the mixed sum. `channel_names` is sorted, so
+            # [1] is the smallest tag's channel; with one channel this branch
+            # keeps using the mixed pressure and the default is unchanged.
+            legacy_boundary_pressure = length(channel_boundary_pressures) >= 2 ?
+                channel_boundary_pressures[1] : mixed_boundary_pressure
+            impedance = impedance_for_radiators(mesh, element_mesh_ids, legacy_boundary_pressure, radiators, drives, FloatType; symmetry_mode=Symbol(symmetry_mode))
+            # MEH opt-in: absent from the result unless the request asked for
+            # it, so the default reply keeps exactly the keys it had.
+            if get_value(config, "impedance_matrix_enabled", false)
+                impedance_matrix = impedance_matrix_for_channels(
+                    mesh, element_mesh_ids, channel_boundary_pressures, radiators,
+                    FloatType; symmetry_mode=Symbol(symmetry_mode),
+                )
+            end
         end
 
         release_assembly_payload!(assembly_payload)
@@ -2127,34 +2175,39 @@ function solve_request_impl(request)
                 ),
             )
         end
+        result = Dict(
+            "freq_hz" => Float32(freq),
+            "horizontal_spl_norm_db" => horizontal_norm,
+            "vertical_spl_norm_db" => vertical_norm,
+            "impedance" => impedance,
+            "horizontal_spl_db" => horizontal_spl,
+            "vertical_spl_db" => vertical_spl,
+            "sphere_spl_norm_db" => sphere_norm,
+            "channel_names" => channel_names,
+            "horizontal_pressure" => complex_rows_to_wire(horizontal_pressure_rows),
+            "vertical_pressure" => complex_rows_to_wire(vertical_pressure_rows),
+            "diagonal_pressure" => diagonal_pressure_rows === nothing ? nothing : complex_rows_to_wire(diagonal_pressure_rows),
+            "diagonal_spl_db" => synthesis.diagonal_spl,
+            "diagonal_spl_norm_db" => synthesis.diagonal_norm,
+            "sphere_pressure" => sphere_pressure_rows === nothing ? nothing : complex_rows_to_wire(sphere_pressure_rows),
+            "surface_pressure" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_pressure) : nothing,
+            "surface_neumann" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_neumann) : nothing,
+            "timings" => Dict(
+                "assembly_s" => Float32(t_assembly),
+                "solve_s" => Float32(t_solve),
+                "field_s" => Float32(t_field),
+            ),
+            "diagnostics" => diagnostics,
+        )
+        # Opt-in only: the default result Dict keeps exactly the keys it had.
+        if impedance_matrix !== nothing
+            result["impedance_matrix"] = impedance_matrix
+        end
         emit_event(
             "result";
             solved_count=index,
             total_count=length(frequencies),
-            result=Dict(
-                "freq_hz" => Float32(freq),
-                "horizontal_spl_norm_db" => horizontal_norm,
-                "vertical_spl_norm_db" => vertical_norm,
-                "impedance" => impedance,
-                "horizontal_spl_db" => horizontal_spl,
-                "vertical_spl_db" => vertical_spl,
-                "sphere_spl_norm_db" => sphere_norm,
-                "channel_names" => channel_names,
-                "horizontal_pressure" => complex_rows_to_wire(horizontal_pressure_rows),
-                "vertical_pressure" => complex_rows_to_wire(vertical_pressure_rows),
-                "diagonal_pressure" => diagonal_pressure_rows === nothing ? nothing : complex_rows_to_wire(diagonal_pressure_rows),
-                "diagonal_spl_db" => synthesis.diagonal_spl,
-                "diagonal_spl_norm_db" => synthesis.diagonal_norm,
-                "sphere_pressure" => sphere_pressure_rows === nothing ? nothing : complex_rows_to_wire(sphere_pressure_rows),
-                "surface_pressure" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_pressure) : nothing,
-                "surface_neumann" => surface_traces_enabled ? complex_vector_to_wire(mixed_boundary_neumann) : nothing,
-                "timings" => Dict(
-                    "assembly_s" => Float32(t_assembly),
-                    "solve_s" => Float32(t_solve),
-                    "field_s" => Float32(t_field),
-                ),
-                "diagnostics" => diagnostics,
-            ),
+            result=result,
         )
         end
     finally

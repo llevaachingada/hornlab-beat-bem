@@ -172,11 +172,6 @@ UNEXERCISABLE_REFUSALS: dict[str, str] = {
         "the absence is checked by reading the result contract rather than "
         "by making a call that raises"
     ),
-    "quantities.per_tag_mean_pressures": (
-        "SolveResult carries one impedance array, not a per-tag mapping; "
-        "with one drivable tag (sources.count) there is no second mean "
-        "pressure to ask for and no argument that would ask for it"
-    ),
     "mesh_input.multiple_bodies": (
         "solve_frequencies takes one mesh path; a second body would need a "
         "second argument that does not exist, so nothing can be passed for "
@@ -409,11 +404,11 @@ def _verify_declared_refusals(
     )
     verified.add("observation.frame.refused.tilted_frame")
 
-    # -- sources: one tag, unit amplitude, real amplitude
+    # -- sources: 1..8 tags, unit amplitude, real amplitude
     _assert_raises(
-        f"{backend}: two source tags",
+        f"{backend}: nine source tags",
         NotImplementedError,
-        lambda: config(velocity_sources={2: 1.0, 3: 1.0}),
+        lambda: config(velocity_sources={tag: 1.0 for tag in range(1, 10)}),
     )
     verified.add("sources.count.refused_note")
     _assert_raises(

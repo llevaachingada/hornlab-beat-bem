@@ -60,9 +60,11 @@ EXPECTED_OPTIONAL_REQUEST_CONFIG_KEYS = [
     "diagonal_enabled",
     "diagonal_inclination_deg",
     "ground_plane_min_clearance_m",
+    "impedance_matrix_enabled",
     "near_correction_cutoff",
     "near_correction_enabled",
     "near_correction_order",
+    "radiators",
     "regular_quadrature_mode",
     "solve_precision",
     "spherical_grid",
@@ -120,6 +122,8 @@ def test_the_request_payload_shape_is_pinned_not_only_its_version_number():
         surface_traces=True,
         regular_quadrature_mode="fixed",
         ground_plane=GroundPlane(enabled=True, axis="y"),
+        impedance_matrix=True,
+        velocity_sources={2: 1.0, 10: 1.0},
         observation=ObservationConfig(
             planes=["horizontal", "vertical", "diagonal"], sphere_grid=(2, 3)
         ),
@@ -358,12 +362,19 @@ def test_wavelength_quadrature_is_reported_as_a_cpu_only_mode():
             assert "wavelength" in regular["refused_modes"]
 
 
-def test_the_source_contract_reports_one_unit_amplitude_tag():
-    sources = backend_capabilities(beat.BEAT_CPU)["modes"]["exterior"]["sources"]
-    assert sources["count"]["supported"] == 1
+def test_the_source_contract_reports_one_to_eight_unit_amplitude_tags():
+    exterior = backend_capabilities(beat.BEAT_CPU)["modes"]["exterior"]
+    sources = exterior["sources"]
+    assert sources["count"]["supported"] == list(range(1, 9))
+    assert sources["count"]["supported_min"] == 1
+    assert sources["count"]["supported_max"] == 8
     assert sources["amplitude"]["supported"] == [1.0]
     assert set(sources["profiles"]["supported"]) == {"normal", "axial"}
     assert set(sources["profiles"]["refused"]) >= {"taper", "annular", "per_face", "callable"}
+    # Per-tag mean pressures are reachable only through the opt-in matrix.
+    per_tag = exterior["quantities"]["per_tag_mean_pressures"]
+    assert per_tag["supported"] == "impedance_matrix"
+    assert per_tag["requires"] == "SolveConfig.impedance_matrix=True"
 
 
 def test_the_completion_statuses_cover_what_a_sweep_can_end_as():

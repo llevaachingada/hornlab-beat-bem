@@ -72,6 +72,7 @@ include(joinpath(@__DIR__, "coupled_solver_tests.jl"))
 include(joinpath(@__DIR__, "coupled_condensed_tests.jl"))
 include(joinpath(@__DIR__, "cpu_simd_kernel_tests.jl"))
 include(joinpath(@__DIR__, "regular_quadrature_default_tests.jl"))
+include(joinpath(@__DIR__, "impedance_matrix_tests.jl"))
 
 @testset "cpu BLAS thread policy" begin
     @test beat_cpu_blas_thread_count(441; available_threads=16) == 1
