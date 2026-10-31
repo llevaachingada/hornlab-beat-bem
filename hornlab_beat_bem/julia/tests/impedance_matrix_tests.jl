@@ -160,7 +160,7 @@ end
     function driver_result(mesh_path, radiators)
         request = Dict{String,Any}(
             "schema_version" => 2,
-            "beat_engine_backend" => "cpu",
+            "beat_engine_backend" => get(ENV, "MEH_TEST_BACKEND", "cpu"),
             "frequencies_hz" => [100.0],
             "config" => Dict{String,Any}(
                 "mesh_file" => mesh_path,
